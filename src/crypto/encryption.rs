@@ -32,8 +32,10 @@ use crate::errors::{CrDrError, Result};
 use crate::types::{f_to_bytes_be, fserde, fserde_vec, F, PLAINTEXT_FIELD_LEN};
 
 /// EA encryption secret key (BabyJubJub scalar).
-#[derive(Debug, Clone)]
-pub struct EaSecretKey(pub JubScalar);
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EaSecretKey(
+    #[serde(with = "crate::crypto::signature::jubserde")] pub JubScalar,
+);
 
 /// EA encryption public key (BabyJubJub point).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

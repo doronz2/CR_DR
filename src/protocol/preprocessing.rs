@@ -51,11 +51,12 @@ pub fn preprocess_voter<R: RngCore + CryptoRng>(
 }
 
 /// Finalized public registration state.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RegistrationState {
     /// Records ordered by voter id; leaf index = position in this order.
     pub records: BTreeMap<VoterId, PublicRegistrationRecord>,
     pub leaf_index: HashMap<VoterId, usize>,
+    #[serde(with = "crate::types::fserde")]
     pub root: F,
     pub paths: HashMap<VoterId, MerklePath>,
     pub merkle_depth: usize,

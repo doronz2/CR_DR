@@ -7,7 +7,7 @@ use rand::{CryptoRng, Rng, RngCore};
 
 use crate::types::Ballot;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct BulletinBoard {
     entries: Vec<Ballot>,
 }
@@ -43,7 +43,7 @@ impl BulletinBoard {
 /// Modeled anonymous submission channel: collects ballots and releases them
 /// in a random order with sender identities dropped. Ballot bytes are
 /// preserved verbatim.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct AnonymousChannel {
     pending: Vec<Ballot>,
 }

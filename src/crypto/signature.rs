@@ -82,8 +82,29 @@ pub fn base8() -> JubAffine {
     p
 }
 
-#[derive(Debug, Clone)]
-pub struct SecretKey(pub JubScalar);
+/// Serde helpers for BabyJubJub scalars (decimal strings).
+pub mod jubserde {
+    use super::JubScalar;
+    use ark_ff::{BigInteger, PrimeField};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &JubScalar, s: S) -> std::result::Result<S::Ok, S::Error> {
+        let bytes = v.into_bigint().to_bytes_be();
+        s.serialize_str(&num_bigint::BigUint::from_bytes_be(&bytes).to_str_radix(10))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> std::result::Result<JubScalar, D::Error> {
+        let s = String::deserialize(d)?;
+        let n = num_bigint::BigUint::parse_bytes(s.as_bytes(), 10)
+            .ok_or_else(|| serde::de::Error::custom("bad decimal scalar"))?;
+        Ok(JubScalar::from_le_bytes_mod_order(&n.to_bytes_le()))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecretKey(#[serde(with = "jubserde")] pub JubScalar);
 
 /// Verification key: BabyJubJub point (affine coordinates in F).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

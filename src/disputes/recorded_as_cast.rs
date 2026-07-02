@@ -22,9 +22,11 @@ pub fn check_direct(bb: &BulletinBoard, ballot_bytes: &[u8]) -> bool {
 }
 
 /// EA submission receipt: Sign_EA(eid_hash, ballot_hash, timestamp).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SubmissionReceipt {
+    #[serde(with = "crate::types::fserde")]
     pub eid_hash: F,
+    #[serde(with = "crate::types::fserde")]
     pub ballot_hash: F,
     pub timestamp: u64,
     pub sig: Signature,

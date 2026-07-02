@@ -127,12 +127,13 @@ pub struct PublicParams {
 }
 
 /// Everything the voter holds after preprocessing.
-/// NOTE: the voter never holds R_EA,i.
-#[derive(Debug, Clone)]
+/// NOTE: the voter never holds R_EA,i (and this type cannot carry it).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VoterState {
     pub id: VoterId,
     pub sk: SecretKey,
     pub vk: VerificationKey,
+    #[serde(with = "fserde")]
     pub r: Nonce,
 }
 
@@ -151,16 +152,19 @@ pub struct PublicRegistrationRecord {
 
 /// Authority-side per-voter secret (contains R_EA,i — never leaves the EA
 /// except toward the private judge / threshold shares).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthorityVoterSecret {
     pub id: VoterId,
     pub vk: VerificationKey,
+    #[serde(with = "fserde")]
     pub r: Nonce,
+    #[serde(with = "fserde")]
     pub r_ea: Nonce,
 }
 
-/// Authority secret state.
-#[derive(Debug)]
+/// Authority secret state. Serializable only so the CLI can persist it in
+/// the authority's private directory — never publish it.
+#[derive(Debug, Serialize, Deserialize)]
 pub struct AuthoritySecretState {
     /// EA decryption key (ElGamal backend).
     pub sk_ea: crate::crypto::encryption::EaSecretKey,

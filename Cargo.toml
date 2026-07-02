@@ -21,13 +21,14 @@ thiserror = "1"
 anyhow = "1"
 hex = "0.4"
 num-bigint = "0.4"
+clap = { version = "4", features = ["derive"] }
 
 [dev-dependencies]
 proptest = "1.4"
 tempfile = "=3.10.1"
 
 [[bin]]
-name = "cr_dr_demo"
+name = "cr_dr"
 path = "src/main.rs"
 
 [[bin]]

@@ -18,11 +18,12 @@ use crate::types::{Ballot, BallotPlaintext, Candidate, F, Nonce, PublicParams, V
 
 /// Everything the coerced voter surrenders to the coercer. Note it contains
 /// the REAL signing key — coercion resistance does not rest on hiding sk_i.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FakeComplianceTranscript {
     pub voter_id: u64,
     pub sk: SecretKey,
     pub vk: VerificationKey,
+    #[serde(with = "crate::types::fserde")]
     pub r_fake: Nonce,
     pub requested_candidate: Candidate,
     pub sigma_fake: Signature,
