@@ -1,0 +1,9 @@
+{
+  "name": "cr_dr_zk_deps",
+  "private": true,
+  "description": "ZK toolchain deps for the CR-DR reference implementation",
+  "dependencies": {
+    "circomlib": "^2.0.5",
+    "snarkjs": "^0.7.5"
+  }
+}

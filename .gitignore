@@ -1,0 +1,10 @@
+/target
+/build
+/node_modules
+Cargo.lock
+package-lock.json
+*.ptau
+*.zkey
+*.wtns
+*.r1cs
+*.sym
