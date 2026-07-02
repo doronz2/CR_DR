@@ -143,8 +143,12 @@ fn which_node() -> Option<PathBuf> {
 }
 
 fn tempdir() -> Result<PathBuf> {
-    let dir = std::env::temp_dir().join(format!("cr_dr_zk_{}", std::process::id()))
-        .join(format!("{}", nanos()));
+    // Unique per call even across parallel test threads: pid + atomic counter.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir()
+        .join(format!("cr_dr_zk_{}_{}_{}", std::process::id(), n, nanos()));
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }
