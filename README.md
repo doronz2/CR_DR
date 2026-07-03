@@ -276,29 +276,108 @@ modeled as leakage (demonstrated in `negative_attack_tests`).
 encodes a particular candidate is exactly the artifact that becomes a
 receipt in a coercer's hands; it needs a separate treatment.
 
-## 9. Repository layout
+## 9. Code map — what is implemented where
 
-```text
-src/
-  main.rs        cr_dr CLI (all procedures independently invocable)
-  crypto/        Poseidon (circomlib-compatible), Schnorr/BabyJubJub,
-                 commitment-mode + ElGamal-hybrid encryption, Merkle, Shamir
-  protocol/      setup, preprocessing (+ cut-and-choose), voting,
-                 fake compliance, chaff, bulletin board, FilterAndTally
-  threshold/     trusted-dealer Shamir + malicious-view simulator interface
-  zk/            statement, witness builder, native relation checker,
-                 circom input generation, snarkjs Groth16 backend
-  disputes/      recorded-as-cast, tallied-as-recorded, judge verdicts
-circuits/
-  main/          FilterAndTally template + small/medium instantiations
-  components/    poseidon_hashes, merkle_membership, signature_verify,
-                 encryption_decrypt, ballot_validity, duplicate_first_valid,
-                 tally_accumulator
-  input_examples/  small_valid_input.json, fake_before_real_input.json
-scripts/         install_circom_deps, compile_circuits, setup_groth16,
-                 prove, verify
-tests/           12 suites: protocol correctness + security invariants
-```
+### Crate root
+
+| file | implements |
+|---|---|
+| `src/lib.rs` | Crate root: module tree and re-exports; scope statement (construction only, no CR game). |
+| `src/main.rs` | The **`cr_dr` CLI**. One subcommand per protocol procedure (`setup`, `register-voter`, `finalize-registration`, `vote`, `fake-compliance`, `build-fake-ballot`, `chaff`, `submit`, `flush-channel`, `show-board`, `tally`, `prove`, `verify`, `check-recorded`, `issue-receipt`, `dispute-recorded`, `dispute-tally`, `share-nonces`, `demo`). Defines the election-directory layout and enforces the trust split (`public/` vs `authority/secret.json` vs `voters/<id>.json`). |
+| `src/bin/gen_example_inputs.rs` | Deterministically regenerates the checked-in circuit inputs in `circuits/input_examples/` (a valid mixed board, and the fake-before-real scenario), asserting they satisfy the native relation. |
+| `src/types.rs` | All core protocol types: `F` (BN254 scalar), `PublicParams`, `ElectionConfig`, `DuplicateRule` (+ its statement id), `ThresholdParams`, `VoterState` (sk_i, vk_i, R_i — **cannot** carry R_EA,i), `PublicRegistrationRecord` (h_i, leaf_i), `AuthorityVoterSecret` / `AuthoritySecretState` (where R_EA,i lives), `BallotPlaintext` with the canonical **9-field encoding** `[eid_hash, id, vk.x, vk.y, candidate, R, sig.Rx, sig.Ry, sig.S]` (`to_fields`/`from_fields`), `Ballot` (ciphertext + EA payload + exact public `bytes`), `TallyResult` (the only public tally output), `InternalBallotStatus`/`InternalBallotEvaluation` (test/debug only, deliberately non-serializable). Also the field⇄decimal-string serde helpers (`f_to_dec`, `f_from_dec`, `fserde`). |
+| `src/errors.rs` | `CrDrError` (thiserror): config, duplicate-voter, crypto, Merkle, threshold, cut-and-choose audit, ZK-toolchain errors. |
+
+### `src/crypto/` — primitives (layer A: native, circuit-compatible)
+
+| file | implements |
+|---|---|
+| `poseidon_native.rs` | `poseidon(&[F]) -> F` via `light-poseidon`, parameter-identical to circomlib's `Poseidon`; unit tests pin known circomlibjs vectors. Every in-circuit hash routes through this. |
+| `hash.rs` | All protocol hashes: `eid_to_field` (SHA-256 → field, outside the circuit), **`h_com`** (`H_com`, arity 6), **`h_reg`** (`H_reg`, arity 5), `sig_msg_hash` (arity 4), `ct_commit` (commitment-mode ciphertext, arity 10), `merkle_hash` (arity 2), `bb_commitment` (Poseidon chain over posted ciphertext fields), `candidate_set_commitment`, `pk_ea_commitment`, `ballot_hash` (for receipts). |
+| `signature.rs` | The ZK-friendly signature: **Schnorr over BabyJubJub with Poseidon challenge** — `keygen`, `sign`, `verify` (checks `S·B8 == R + c·A`), `challenge`. Also the circomlib⇄arkworks curve-form isomorphism (`to_circom_point`/`from_circom_point`, `x_ark = √168700·x_circom`), circomlib `Base8` constants, scalar embedding helpers (`jub_scalar_from_field`, `f_is_canonical_scalar`), point decoding with subgroup checks, and scalar serde. |
+| `encryption.rs` | Both ballot-encryption backends. **Commitment mode (default, circuit-matched)**: `commit_encrypt` (`ct = Poseidon(fields‖rho)`), `commit_open`, `opening_to_payload` — with the loud not-real-PKE warning. **BabyJubJub ElGamal + Poseidon-pad hybrid (native, swap-in target)**: `ea_keygen`, `elgamal_encrypt`, `elgamal_decrypt`. `Ciphertext::to_bytes` fixes the exact public byte encoding used for recorded-as-cast. |
+| `merkle.rs` | Fixed-depth Poseidon Merkle tree over registration leaves: `MerkleTree::new/root/path`, `MerklePath`, `verify_path` — bit-for-bit the circuit's `MerkleMembership`. |
+| `shamir.rs` | Shamir secret sharing over BN254: `share` (degree t−1 polynomial), `reconstruct` (Lagrange at 0), with tests that <t shares don't reconstruct. |
+
+### `src/protocol/` — the construction
+
+| file | implements |
+|---|---|
+| `setup.rs` | `setup_election(config)` → (`PublicParams`, `AuthoritySecretState`): validates candidates/capacities/threshold params; generates the EA encryption keypair and EA receipt-signing keypair. |
+| `preprocessing.rs` | Registration. `preprocess_voter`: samples (sk_i, vk_i, R_i, R_EA,i), computes h_i and leaf_i, stores R_EA,i **only** in the authority state, returns the voter state (no R_EA,i) + public record. `finalize_registration`: uniqueness checks, Merkle tree over leaves, `RegistrationState` (records, root MR, per-voter paths). **Cut-and-choose**: `preprocess_voter_cut_and_choose` (q pairs, q−1 audited by opening R_EA^k, unopened pair becomes final; abort with evidence on mismatch), `..._with_cheat` (test hook), `estimate_cut_and_choose_soundness` (Monte-Carlo ≈ 1/q). |
+| `vote.rs` | `cast_vote`: candidate check, `sigma = Sign_sk(eid, i, m, R_i)`, encrypt the 9-field plaintext, fix the exact public bytes. |
+| `fake_compliance.rs` | **The coercion story.** `FakeComplianceTranscript` — what the voter surrenders (REAL sk_i, FAKE nonce R*, requested candidate, valid signature). `fake_compliance` builds it (samples R* ≠ R_i); `build_fake_ballot` produces the coercer's ballot, publicly indistinguishable from a real one. |
+| `chaff.rs` | `chaff_ballot`: fresh unregistered identity, in-range voter id, valid signature — passes every syntactic check, fails only the hidden registration relation; same shape and rejection class as fake ballots. |
+| `bulletin_board.rs` | `BulletinBoard` (append-only; `list_public_ballots`, **`contains_exact_bytes`** for recorded-as-cast) and `AnonymousChannel` (`submit`, `flush_shuffled` — drops sender identity, shuffles order, preserves bytes). |
+| `filter_and_tally.rs` | **Exact FilterAndTally.** Per ballot, in board order: (a) open/decrypt → (b) parse → (c) eid → (d) candidate ∈ C → (e) signature → (f) registration record for (id, vk) → (g) fetch R_EA,i → (h) recompute h/leaf + Merkle check → (i) *only now valid* → (j) first-valid-counts duplicate rule. Returns the public `TallyResult` plus the internal per-ballot log (tests only). The validity-before-duplicates invariant lives here. |
+
+### `src/threshold/` — authority-nonce threshold models
+
+| file | implements |
+|---|---|
+| `trusted_dealer.rs` | Model 1: `share_nonce` / `reconstruct_nonce` (Shamir on each R_EA,i), `share_all_nonces` (populates the authority state), `authority_share` (a single authority's share). |
+| `malicious_view_model.rs` | Model 2: the `ThresholdViewSimulator` trait — simulates **only the honest-generated part** of corrupted authorities' views; `AdversaryAuxiliaryState` carries the adversary's own inputs/messages as *context, never output*; `SimulatedCorruptedAuthorityView`; `TrustedDealerShamirSimulator` (samples <t shares uniformly — valid precisely because <t Shamir shares are secret-independent; constructed from public data only, no R_EA,i anywhere in its API). |
+
+### `src/zk/` — the exact-tally proof
+
+| file | implements |
+|---|---|
+| `mod.rs` | `CircuitShape` (compile-time NB/NC/depth) and `SMALL_SHAPE` = (16, 3, 4), matching the compiled small circuit. |
+| `statement.rs` | `TallyStatement` — the public inputs and nothing else (eid_hash, MR, candidate-set commitment, bb_commitment, counts, sizes, rule id, pk_ea commitment); `build_tally_statement` from public data only. |
+| `witness.rs` | `TallyWitness`/`BallotWitnessRow` (per-ballot private inputs: ct, 9 plaintext fields, rho, R_EA, Merkle path). `build_tally_witness` mirrors FilterAndTally's decisions and applies the **dummy-substitution policy**: ballots whose contents would violate the circuit's *hard* constraints (unopenable, off-curve points, identity vk, non-canonical S) get safe dummy fields so the witness stays satisfiable while their validity flag is 0 — the same verdict native tallying reached. `padding_row`/`padded_rows` fill circuit slots beyond `num_ballots`. |
+| `mock_backend.rs` | `relation_check_native` — the native mirror of the circuit, constraint-for-constraint: soft flags (opening, eid, candidate, signature, Merkle root), hard-constraint failures reported as unsatisfiable, O(B²) duplicate logic, BB chain, tally equality. Includes `circuit_sig_ok` with **bit-exact integer scalar multiplication** (`mul_bits`) matching circomlib's `EscalarMulAny`/`EscalarMulFix` semantics. |
+| `circom_io.rs` | `generate_witness_input` — serializes (statement, witness) into the circuit's `input.json` (decimal strings, signal names matching the main component). |
+| `groth16_backend.rs` | `SnarkjsBackend` — Groth16 via the snarkjs CLI: artifact discovery (`toolchain_available`), `generate_witness` (wasm), `prove` → (proof.json, public.json), `verify`. Race-free per-call work directories. |
+
+### `src/disputes/` — private dispute resolution
+
+| file | implements |
+|---|---|
+| `judge.rs` | `Verdict` (`AuthorityFaulty`/`VoterFaulty`/`BoardFaulty`/`Undetermined`) and `JudgeReport` — judge-private, never contains R_EA,i. |
+| `recorded_as_cast.rs` | Direct mode: `check_direct` (exact byte membership). Authority-mediated mode: `SubmissionReceipt` = `Sign_EA(eid, ballot_hash, timestamp)`, `ea_issue_receipt`, `verify_receipt`, and `adjudicate_recorded_as_cast` (valid receipt + missing bytes ⇒ `BoardFaulty`). |
+| `tallied_as_recorded.rs` | `judge_tallied_as_recorded` — the paper's checks 1–7: ballot opens to the claimed plaintext; signature verifies; `h = H_com(…, R, R_EA,i)` against the public record (**this is where a fake nonce is privately detected**); leaf/MR consistency (mismatch after a good h ⇒ `AuthorityFaulty`); duplicate status under the public rule; tally-proof verification. `NonceSource` lets the judge take R_EA,i directly from the EA or reconstruct it from ≥t threshold shares. |
+
+### `circuits/` — the Circom side
+
+| file | implements |
+|---|---|
+| `components/poseidon_hashes.circom` | `HCom`, `HReg`, `MessageHashForSignature` — the three protocol hashes as Poseidon gadgets (arities 6/5/4, matching `crypto/hash.rs`). |
+| `components/merkle_membership.circom` | `MerkleMembership(depth)` — recomputes the root from leaf + path; **soft** `ok` output so non-membership invalidates the ballot instead of the whole witness. |
+| `components/signature_verify.circom` | `SchnorrVerify` — in-circuit Schnorr: Poseidon challenge, `Num2Bits`, circomlib `EscalarMulAny` (c·A) and `EscalarMulFix` (S·Base8), `BabyAdd`, point equality as a soft flag; `BabyCheck` on-curve checks are the documented hard constraints. |
+| `components/encryption_decrypt.circom` | `CiphertextOpen(nFields)` — commitment-mode opening check (soft), plus the documented TODO for the BabyJubJub-ElGamal decryption swap (`ss = sk_EA·C1`). |
+| `components/ballot_validity.circom` | `BallotValidity(depth, nCand)` — wires opening ∧ eid ∧ candidate one-hot ∧ signature ∧ `HCom→HReg→Merkle` into one `valid` flag; exposes `voter_id` and the candidate selector. |
+| `components/duplicate_first_valid.circom` | `DuplicateFirstValid(nB)` — Strategy A, O(B²): `counted[j] = valid[j] · Π_{k<j}(1 − valid[k]·same_id(k,j))`; invalid ballots can never block. Strategy B (sorted witness) stubbed as TODO. |
+| `components/tally_accumulator.circom` | `TallyAccumulator(nB, nC)` — sums `counted·candSel` per candidate and constrains equality with the public `tally_counts`. |
+| `main/filter_and_tally.circom` | `FilterAndTally(nB, nC, depth)` — the whole relation: duplicate-rule pin, candidate-set commitment opening, `num_ballots` range + active flags, per-ballot validity, the BB Poseidon-chain binding, duplicates, tally. |
+| `main/filter_and_tally_small.circom` / `_medium.circom` | Instantiations: (16, 3, 4) ≈ 106k constraints, and (128, 3, 6). Public-input list declared here. |
+| `input_examples/*.json` | Ready-to-prove inputs: `small_valid_input.json` (real + fake + chaff) and `fake_before_real_input.json` (the critical invariant, provable). |
+
+### `scripts/` — ZK toolchain
+
+| file | does |
+|---|---|
+| `install_circom_deps.sh` | Installs circom 2 (cargo) and snarkjs + circomlib (npm, repo-local). |
+| `compile_circuits.sh [small\|medium]` | `circom → r1cs + wasm + sym` into `build/circuits`, prints constraint counts. |
+| `setup_groth16.sh [variant]` | **Dev-only** setup: sizes the power of tau from the constraint count, generates a local ptau (new/contribute/prepare), Groth16 phase-2, exports the verification key. |
+| `prove.sh <input.json> [variant]` | Witness (wasm) + `snarkjs groth16 prove`. |
+| `verify.sh [proof] [public] [variant]` | `snarkjs groth16 verify`. |
+
+### `tests/` — 12 suites
+
+| file | covers |
+|---|---|
+| `setup_tests.rs` | Config validation; parameter consistency. |
+| `preprocessing_tests.rs` | Voter gets sk/R but never R_EA; h/leaf correctness; MR membership; duplicate-id rejection; cut-and-choose honest/cheating runs and the ≈1/q soundness estimate. |
+| `voting_tests.rs` | Real ballots count; candidate/registration guards; exact-byte ballot encoding. |
+| `fake_compliance_tests.rs` | Coercer-side signature verifies; fake rejected at the nonce relation; **fake-before-real doesn't block**; shape indistinguishability. |
+| `chaff_tests.rs` | Chaff rejected; same shape and rejection class as fakes; no markers. |
+| `filter_and_tally_tests.rs` | Every rejection path (decryption/format/eid/candidate/signature/wrong-key/nonce), duplicates, empty board. |
+| `duplicate_rule_tests.rs` | First-valid-counts; invalid ballots never consume slots; cross-voter independence. |
+| `zk_statement_tests.rs` | Native relation accepts valid witnesses, rejects wrong tallies and every tampered public input; witness flags match the tally; the statement leaks no identities/labels. |
+| `groth16_integration_tests.rs` | Real prove+verify; tampered public input rejected; wrong tally unprovable; cross-instance mismatch rejected; proof/public contain no witness data. Skips cleanly if artifacts are absent. |
+| `dispute_tests.rs` | Recorded-as-cast present/absent/receipt; private fake-nonce detection; judge never leaks R_EA; threshold-share reconstruction path; duplicate complaints. |
+| `threshold_tests.rs` | Shamir t-of-k reconstruction; <t failure; simulator API takes no secrets; aux is context, not output; refuses ≥t corruptions. |
+| `negative_attack_tests.rs` | The broken-variant demonstrations: duplicates-before-validity enables vote cancellation; published identities leak forced abstention; leaked R_EA breaks fake compliance; public verdicts leak evasion. |
 
 ## 10. Design notes & compatibility
 
