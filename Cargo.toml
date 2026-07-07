@@ -26,6 +26,7 @@ clap = { version = "4", features = ["derive"] }
 [dev-dependencies]
 proptest = "1.4"
 tempfile = "=3.10.1"
+criterion = "0.5"
 
 [[bin]]
 name = "cr_dr"
@@ -34,3 +35,7 @@ path = "src/main.rs"
 [[bin]]
 name = "gen_example_inputs"
 path = "src/bin/gen_example_inputs.rs"
+
+[[bench]]
+name = "prover"
+harness = false

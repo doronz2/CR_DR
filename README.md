@@ -36,15 +36,22 @@ Validity of a ballot depends on **two nonces**:
 
 | value    | who knows it |
 |----------|--------------------------------------------------|
-| `R_i`    | the voter |
-| `R_EA,i` | **only** the election authority (or threshold-shared among authority servers) |
+| `R_i`    | **only** the voter (sampled voter-side; never an authority input) |
+| `R_EA,i` | **nobody in the plain** — threshold-shared t-of-k among the authority servers at generation time; only a ≥ t quorum (the *logical* EA) can reconstruct |
 
-Preprocessing publishes a binding-but-hiding commitment to both:
+Preprocessing is a threshold-private functionality: the voter samples and
+keeps `(sk_i, vk_i, R_i)`; the authority side threshold-generates `R_EA,i`
+(Shamir t-of-k, plain value erased — any < t coalition holds shares that
+are independent of it, and no authority ever sees `R_i`). Only inside the
+functionality do the two nonces meet, exactly long enough to publish a
+binding-but-hiding commitment into the **indexed** registration table
+(voter id = Merkle leaf index):
 
 ```text
+Reg[i] = (i, vk_i, h_i)
 h_i    = H_com(eid, i, vk_i, R_i, R_EA,i)      (Poseidon)
 leaf_i = H_reg(eid, i, vk_i, h_i)              (Poseidon)
-MR     = Merkle root over all leaf_i
+MR     = Merkle root over (leaf_0, ..., leaf_{N-1})
 ```
 
 A ballot encrypts `(eid, i, vk_i, m, R, sigma)` with
@@ -99,12 +106,20 @@ Each item is enforced by tests (see `tests/`):
    (`groth16_integration_tests`)
 7. A wrong tally fails both the native relation check and proving.
    (`zk_statement_tests`, `groth16_integration_tests`)
-8. The voter never receives `R_EA,i` — structurally: `VoterState` cannot
-   carry it. (`preprocessing_tests`)
+8. State separation is structural: `VoterState` cannot carry `R_EA,i`;
+   the authority state holds only threshold shares of `R_EA,i` and cannot
+   recover `R_i`; fewer than `t` shares reconstruct nothing.
+   (`preprocessing_tests`)
 9. The judge resolves validity disputes using `R_EA,i` without giving it to
    the voter. (`dispute_tests`)
 10. Chaff is rejected but indistinguishable from ordinary invalid ballots.
     (`chaff_tests`)
+11. The tally prover cannot flip a valid in-range ballot to invalid by
+    withholding or substituting its registration path — the indexed row
+    fetch is a hard constraint. (`zk_statement_tests`)
+12. Strategy A (naive) and Strategy B (sorted-record) duplicate handling
+    agree on all boards, randomized included. (`protocol::duplicates`
+    tests)
 
 Negative tests additionally demonstrate the attacks when invariants are
 broken: duplicates-before-validity lets a coercer cancel votes; publishing
@@ -123,9 +138,12 @@ cargo run --bin cr_dr -- demo       # end-to-end demo in memory
 
 # ZK pipeline (dev-only trusted setup):
 scripts/install_circom_deps.sh      # circom 2 (cargo), snarkjs+circomlib (npm)
-scripts/compile_circuits.sh small   # ~106k constraints
+scripts/compile_circuits.sh small   # ~116k constraints (Strategy B)
 scripts/setup_groth16.sh small      # local ptau + zkey — DEV ONLY
 cargo test                          # now includes Groth16 prove/verify
+cargo bench --bench prover          # pipeline benchmarks (see §6)
+scripts/install_rapidsnark.sh       # optional: native prover (~12-14x faster
+                                    # proving; same artifacts + verifier)
 ```
 
 ## 5. Running procedures independently (CLI)
@@ -183,28 +201,70 @@ cr_dr dispute-tally --ballot fake.json --use-threshold
 
 ## 6. The ZK circuit
 
-`circuits/main/filter_and_tally.circom` — `FilterAndTally(nB, nC, depth)`
+`circuits/main/filter_and_tally.circom` — `FilterAndTally(nB, nC, depth, dupStrategy)`
 proves the exact tally over the whole board (Groth16/BN254, Poseidon for all
 in-circuit hashes, Schnorr-over-BabyJubJub signature verification in
 circuit):
 
 * every posted ciphertext — bound by a Poseidon-chain `bb_commitment` — is
   opened and evaluated;
-* per-ballot validity (opening ∧ eid ∧ candidate ∧ signature ∧ hidden-nonce
-  Merkle registration) is computed as **soft** 0/1 flags, so invalid
-  ballots make flags false rather than the witness unsatisfiable;
-* duplicates are resolved **after** validity (first-valid-counts; naive
-  O(B²) Strategy A, with a sorted-witness Strategy B stubbed for scaling);
+* per-ballot soft flags (opening ∧ eid ∧ candidate ∧ signature) drive a 0/1
+  validity, so invalid ballots make flags false rather than the witness
+  unsatisfiable;
+* the **indexed registration row** is fetched by the ballot's claimed id:
+  the id is decomposed with `Num2Bits_strict` (canonical — no prover
+  freedom), `in_range = (id < num_voters)` is a deterministic flag, and for
+  active in-range ids the Merkle **direction bits are the bits of id** and
+  root equality is a HARD constraint on the witness row `(reg_vk, reg_h)`.
+  The prover cannot withhold a valid ballot's path or bind it to another
+  row (`zk_statement_tests::prover_cannot_withhold_...`). vk-equality and
+  the hidden nonce relation `h = H_com(eid,id,vk,R,R_EA)` stay soft;
+  out-of-range / malformed ballots stay soft-invalid;
+* each slot emits a private record `r_j = (valid_j, id_j, pos_j, m_j)`;
+  duplicates are resolved **after** validity by the sorted-record
+  **Strategy B**: a Batcher odd-even mergesort network sorts the records by
+  `(-valid, id, pos)` in-circuit (a deterministic network is
+  simultaneously a permutation proof and a sortedness proof, with no
+  challenge to sample — the sound choice for this Groth16 stack), then
+  `counted_j = valid_sorted_j · [j = 0 ∨ id_j ≠ id_{j-1}]` counts the first
+  valid ballot per identity in one linear pass. The naive O(B²)
+  **Strategy A** is kept as the `*_naive` circuit variants for
+  benchmarking;
 * the accumulated counts are constrained to equal the public
   `tally_counts`.
 
 Public inputs: `eid_hash, MR, candidate_set_commitment, bb_commitment,
 num_ballots, num_voters, duplicate_rule_id, pk_ea_commitment,
-tally_counts[]` — and nothing else. A native relation checker
-(`src/zk/mock_backend.rs`) mirrors the circuit constraint-for-constraint;
-tests keep the two in agreement. Compile-time variants: small
-(16 ballots / 3 candidates / depth 4, ≈106k constraints) and medium
-(128 / 3 / 6) via `scripts/compile_circuits.sh {small|medium}`.
+tally_counts[]` — and nothing else. `num_voters` is circuit-constrained
+(it bounds the in-range window of the indexed table). `pk_ea_commitment`
+carries no in-circuit constraints (the witness has no EA key to check it
+against); it is bound **natively**: verifiers recompute the whole statement
+from public data (`zk::statement::statement_matches_public_data`) and check
+the proof's public inputs are exactly that statement
+(`zk::circom_io::public_inputs_match`) — the CLI does both on every
+`verify` and `dispute-tally`. A native relation checker
+(`src/zk/mock_backend.rs`) mirrors the circuit constraint-for-constraint,
+including the identical sorting-network schedule; tests keep the two in
+agreement. Compile-time variants: small (16 ballots / 3 candidates /
+depth 4, ≈116k constraints), medium (128 / 3 / 6, ≈1.0M), each also as a
+`*_naive` Strategy-A build — `scripts/compile_circuits.sh
+{small|small_naive|medium|medium_naive}`.
+
+### Prover tiers
+
+* **Tier 1 — single prover (implemented, benchmarked below).** One logical
+  prover performs authorized ≥ t reconstructions of the `R_EA,i`
+  (`AuthoritySecretState::r_ea`), assembles the full witness and runs
+  Groth16.
+* **Tier 2 — trusted tally environment.** The same algorithm and interface,
+  executed inside a protected, audited environment. Nothing in the code
+  changes; not separately benchmarked.
+* **Tier 3 — decentralized/threshold prover (future).** Threshold
+  authorities jointly supply the witness without any single party learning
+  everything. The witness builder consumes `R_EA,i` exclusively through the
+  share-based `r_ea()` interface, so an MPC opening can replace it without
+  changing the relation. Not implemented; **no decentralized proving is
+  claimed or benchmarked**.
 
 ### ⚠️ Commitment-mode encryption prototype
 
@@ -226,14 +286,65 @@ ceremony**. Anyone holding the toxic waste can forge tally proofs. Groth16
 setup is circuit-specific: recompile ⇒ redo setup. Never use these keys
 outside development.
 
+### Benchmarks
+
+`cargo bench --bench prover` (criterion, `benches/prover.rs`) runs the full
+SINGLE-PROVER (Tier 1) pipeline. Groups: `e2e_small` / `e2e_medium` (every
+native stage), `duplicates` (Strategy A vs B natively at 16/128/1024),
+`groth16_small` / `groth16_medium` (circuit witness generation, prove,
+verify — for BOTH circuit strategies; a group skips if its artifacts are
+absent). Each group prints its instance parameters at startup. See
+BENCHMARKS.md for the full measured report (machine, toolchain, commands,
+all tables); headline Apple-M3-Max numbers:
+
+| stage | small (16 slots, 116k constraints) | medium (128 slots, 1.01M constraints) |
+|---|---|---|
+| native FilterAndTally | 14 ms | 106 ms |
+| witness construction | 20 ms | 159 ms |
+| native relation check | 14 ms | 122 ms |
+| circuit witness generation (wasm) | 0.64 s | 4.1 s |
+| Groth16 prove — snarkjs (incl. witness gen) | 4.2 s | 31 s |
+| Groth16 prove — **rapidsnark** (native, prove step) | **0.25 s** | **2.2 s** |
+| Groth16 verify | 0.21 s | 0.21 s |
+| prove peak RSS (snarkjs / rapidsnark) | 2.7 GB / 0.15 GB | 7.6 GB / 1.1 GB |
+
+Native duplicate handling (Strategy A naive vs Strategy B sorted): A wins at
+16 records (52 ns vs 104 ns), B wins from 128 (1.15 µs vs 2.11 µs) and is
+12.5× faster at 1024 (12.6 µs vs 157 µs); in-circuit the two are within
+0.1% constraints at 128 slots with the crossover at ≈128.
+
+Groth16 proving cost is set by the compiled circuit size (roughly linear in
+constraints — small ≈ 116k, medium ≈ 1.0M), not by how many board slots are
+occupied; one proof covers the whole board, so the cost is per-tally, not
+per-ballot. Verification is constant-time in circuit size (~0.2 s is
+node/snarkjs startup, not the pairing check). These are Tier-1 numbers: one
+logical prover with the full witness. No decentralized proving is
+benchmarked.
+
+### Scaling beyond one circuit
+
+The monolithic circuit is practical to ~10^3 voters on a laptop and capped
+near ~10^4 by memory and the largest public powers-of-tau (2^28). The
+design sketch for chunked proving — fixed-size validity chunks + sorted-run
+chunks with a Fiat-Shamir grand-product permutation argument and hiding
+boundary/partial-tally commitments — is in **CHUNKED_TALLY_DESIGN.md**
+(review-stage, not implemented).
+
 ## 7. Threshold authority
 
 A single authority knowing all `R_EA,i` is a trust point — it can
-distinguish real from fake nonces. Two models are implemented:
+distinguish real from fake nonces. The intended model is therefore a single
+LOGICAL EA implemented by `k` threshold authorities: every `R_EA,i` is
+Shamir-shared t-of-k **at generation time** (inside the preprocessing
+functionality — the plain nonce is erased immediately) and every use of a
+nonce afterwards (tally witness, judge dispute) is an *authorized ≥ t
+reconstruction* (`AuthoritySecretState::r_ea`). Two models are implemented:
 
 * **Trusted-dealer Shamir** (`threshold/trusted_dealer.rs`): each `R_EA,i`
   is split into `k` shares, threshold `t`. Any `t` reconstruct; any `t−1`
   shares are information-theoretically independent of the secret.
+  `share_all_nonces` re-shares under new parameters via an authorized
+  quorum (share rotation / t,k change).
 * **Malicious preprocessing view model**
   (`threshold/malicious_view_model.rs`): the `ThresholdViewSimulator` trait
   fixes the simulation target precisely — the **honest-generated portion of
@@ -254,7 +365,8 @@ malicious VSS/DKG.**
 ## 8. Private dispute resolution
 
 * **Recorded-as-cast.** The anonymous channel preserves exact bytes, so a
-  voter privately checks `BB.contains_exact_bytes(ballot.bytes)`
+  voter privately checks `BB.contains_exact_bytes(ballot.bytes())` (bytes
+  are derived from the posted ciphertext, never stored separately)
   (`check-recorded`). This is optional for coercion resistance — if a
   coercer demands to see a ballot, the voter shows the *fake* one. With an
   EA submission receipt `Sign_EA(eid, ballot_hash, timestamp)`, a missing
@@ -262,7 +374,10 @@ malicious VSS/DKG.**
 * **Tallied-as-recorded.** The judge privately receives the ballot opening,
   claimed `R_i`, signature, Merkle path — and `R_EA,i`, either from the EA
   or reconstructed from ≥ t threshold shares. It re-runs the validity
-  checks and the duplicate rule and verifies the public tally proof.
+  checks and the duplicate rule and checks the public tally proof against
+  the current statement (`TallyProofStatus`): an invalid proof ⇒
+  `AuthorityFaulty`; a missing/uncheckable proof is `Unavailable` and the
+  complaint stays `Undetermined` — the judge never assumes a proof verifies.
   Verdicts: `AuthorityFaulty` / `VoterFaulty` / `BoardFaulty` /
   `Undetermined`. A fake nonce is detected here **privately** — the voter
   never learns `R_EA,i`, so nothing transferable is created.
@@ -283,9 +398,9 @@ receipt in a coercer's hands; it needs a separate treatment.
 | file | implements |
 |---|---|
 | `src/lib.rs` | Crate root: module tree and re-exports; scope statement (construction only, no CR game). |
-| `src/main.rs` | The **`cr_dr` CLI**. One subcommand per protocol procedure (`setup`, `register-voter`, `finalize-registration`, `vote`, `fake-compliance`, `build-fake-ballot`, `chaff`, `submit`, `flush-channel`, `show-board`, `tally`, `prove`, `verify`, `check-recorded`, `issue-receipt`, `dispute-recorded`, `dispute-tally`, `share-nonces`, `demo`). Defines the election-directory layout and enforces the trust split (`public/` vs `authority/secret.json` vs `voters/<id>.json`). |
+| `src/main.rs` | The **`cr_dr` CLI**. One subcommand per protocol procedure (`setup`, `register-voter`, `finalize-registration`, `vote`, `fake-compliance`, `build-fake-ballot`, `chaff`, `submit`, `flush-channel`, `show-board`, `tally`, `prove`, `verify`, `check-recorded`, `issue-receipt`, `dispute-recorded`, `dispute-tally`, `share-nonces`, `demo`). Defines the election-directory layout and enforces the trust split (`public/` vs `authority/` vs `voters/<id>.json`): `public/board.json` holds ciphertexts only, the EA payloads (openings) go to `authority/ballot_payloads.json`, and `verify`/`dispute-tally` bind the proof's public inputs to the statement recomputed from public data. |
 | `src/bin/gen_example_inputs.rs` | Deterministically regenerates the checked-in circuit inputs in `circuits/input_examples/` (a valid mixed board, and the fake-before-real scenario), asserting they satisfy the native relation. |
-| `src/types.rs` | All core protocol types: `F` (BN254 scalar), `PublicParams`, `ElectionConfig`, `DuplicateRule` (+ its statement id), `ThresholdParams`, `VoterState` (sk_i, vk_i, R_i — **cannot** carry R_EA,i), `PublicRegistrationRecord` (h_i, leaf_i), `AuthorityVoterSecret` / `AuthoritySecretState` (where R_EA,i lives), `BallotPlaintext` with the canonical **9-field encoding** `[eid_hash, id, vk.x, vk.y, candidate, R, sig.Rx, sig.Ry, sig.S]` (`to_fields`/`from_fields`), `Ballot` (ciphertext + EA payload + exact public `bytes`), `TallyResult` (the only public tally output), `InternalBallotStatus`/`InternalBallotEvaluation` (test/debug only, deliberately non-serializable). Also the field⇄decimal-string serde helpers (`f_to_dec`, `f_from_dec`, `fserde`). |
+| `src/types.rs` | All core protocol types: `F` (BN254 scalar), `PublicParams`, `ElectionConfig`, `DuplicateRule` (+ its statement id), `ThresholdParams`, `VoterState` (sk_i, vk_i, R_i — **cannot** carry R_EA,i), `PublicRegistrationRecord` (h_i, leaf_i), `AuthorityVoterSecret` / `AuthoritySecretState` (where R_EA,i lives), `BallotPlaintext` with the canonical **9-field encoding** `[eid_hash, id, vk.x, vk.y, candidate, R, sig.Rx, sig.Ry, sig.S]` (`to_fields`/`from_fields`), `Ballot` (ciphertext + EA-only payload; `.public()` projects the board-safe part, `.bytes()` derives the exact public encoding — never stored), `PublicBallot` (ciphertext only — the ONLY per-ballot data on the public board), `AuthorityBallotPayloads` (EA-private payload store aligned with board order), `TallyResult` (the only public tally output), `InternalBallotStatus`/`InternalBallotEvaluation` (test/debug only, deliberately non-serializable). Also the field⇄decimal-string serde helpers (`f_to_dec`, `f_from_dec`, `fserde`). |
 | `src/errors.rs` | `CrDrError` (thiserror): config, duplicate-voter, crypto, Merkle, threshold, cut-and-choose audit, ZK-toolchain errors. |
 
 ### `src/crypto/` — primitives (layer A: native, circuit-compatible)
@@ -304,18 +419,19 @@ receipt in a coercer's hands; it needs a separate treatment.
 | file | implements |
 |---|---|
 | `setup.rs` | `setup_election(config)` → (`PublicParams`, `AuthoritySecretState`): validates candidates/capacities/threshold params; generates the EA encryption keypair and EA receipt-signing keypair. |
-| `preprocessing.rs` | Registration. `preprocess_voter`: samples (sk_i, vk_i, R_i, R_EA,i), computes h_i and leaf_i, stores R_EA,i **only** in the authority state, returns the voter state (no R_EA,i) + public record. `finalize_registration`: uniqueness checks, Merkle tree over leaves, `RegistrationState` (records, root MR, per-voter paths). **Cut-and-choose**: `preprocess_voter_cut_and_choose` (q pairs, q−1 audited by opening R_EA^k, unopened pair becomes final; abort with evidence on mismatch), `..._with_cheat` (test hook), `estimate_cut_and_choose_soundness` (Monte-Carlo ≈ 1/q). |
+| `preprocessing.rs` | **Threshold-private registration** (idealized functionality F_prep). `voter_registration_secrets`: the VOTER samples (sk_i, vk_i, R_i). `preprocess_voter`: authority side threshold-generates R_EA,i (Shamir t-of-k, plain value erased), F_prep computes h_i/leaf_i; voter gets (sk,vk,R), authority gets ONLY shares, public gets (i, vk_i, h_i, leaf_i). `finalize_registration`: enforces DENSE ids 0..N-1 (indexed table: id = leaf index), Merkle tree over leaves, `RegistrationState`. **Cut-and-choose**: `preprocess_voter_cut_and_choose` (voter's R fixed; q candidate R_EA^k, q−1 audited by opening, unopened pair final + threshold-shared), `..._with_cheat` (test hook), `estimate_cut_and_choose_soundness` (Monte-Carlo ≈ 1/q). |
 | `vote.rs` | `cast_vote`: candidate check, `sigma = Sign_sk(eid, i, m, R_i)`, encrypt the 9-field plaintext, fix the exact public bytes. |
 | `fake_compliance.rs` | **The coercion story.** `FakeComplianceTranscript` — what the voter surrenders (REAL sk_i, FAKE nonce R*, requested candidate, valid signature). `fake_compliance` builds it (samples R* ≠ R_i); `build_fake_ballot` produces the coercer's ballot, publicly indistinguishable from a real one. |
 | `chaff.rs` | `chaff_ballot`: fresh unregistered identity, in-range voter id, valid signature — passes every syntactic check, fails only the hidden registration relation; same shape and rejection class as fake ballots. |
-| `bulletin_board.rs` | `BulletinBoard` (append-only; `list_public_ballots`, **`contains_exact_bytes`** for recorded-as-cast) and `AnonymousChannel` (`submit`, `flush_shuffled` — drops sender identity, shuffles order, preserves bytes). |
-| `filter_and_tally.rs` | **Exact FilterAndTally.** Per ballot, in board order: (a) open/decrypt → (b) parse → (c) eid → (d) candidate ∈ C → (e) signature → (f) registration record for (id, vk) → (g) fetch R_EA,i → (h) recompute h/leaf + Merkle check → (i) *only now valid* → (j) first-valid-counts duplicate rule. Returns the public `TallyResult` plus the internal per-ballot log (tests only). The validity-before-duplicates invariant lives here. |
+| `bulletin_board.rs` | `BulletinBoard` (append-only over `PublicBallot`s — ciphertexts only, safe to publish wholesale; `list_public_ballots`, **`contains_exact_bytes`** for recorded-as-cast) and `AnonymousChannel` (`submit`, `flush_shuffled` — drops sender identity, shuffles order, preserves bytes). |
+| `filter_and_tally.rs` | **Exact FilterAndTally.** Per ballot: (a) open/decrypt → (b) parse → (c) eid → (d) candidate ∈ C → (e) signature → (f)-(h) `registration_check` — the shared deterministic INDEXED-row predicate (row Reg[id] selected by the claimed id; vk equality; hidden nonce relation via authorized ≥t R_EA reconstruction; leaf/root consistency) → (i) *only now valid* → emit record r_j. Duplicates via sorted-record Strategy B (`duplicates.rs`), then tally. `registration_check` is also the judge's predicate — tally and disputes always agree. Validity-before-duplicates lives here. |
+| `duplicates.rs` | Duplicate strategies over private records r_j = (valid, id, pos, m): `counted_flags_naive` (Strategy A, O(B²) reference) and `counted_flags_sorted` (Strategy B, MAIN: sort by (-valid,id,pos), explicit multiset-equality check, linear first-in-identity-block pass). Both agree on all inputs (tested incl. randomized). |
 
 ### `src/threshold/` — authority-nonce threshold models
 
 | file | implements |
 |---|---|
-| `trusted_dealer.rs` | Model 1: `share_nonce` / `reconstruct_nonce` (Shamir on each R_EA,i), `share_all_nonces` (populates the authority state), `authority_share` (a single authority's share). |
+| `trusted_dealer.rs` | Model 1: `share_nonce` / `reconstruct_nonce` (Shamir on each R_EA,i), `share_all_nonces` (authorized ≥t RE-share under new t,k — shares exist from registration time), `authority_share` (a single authority's share). |
 | `malicious_view_model.rs` | Model 2: the `ThresholdViewSimulator` trait — simulates **only the honest-generated part** of corrupted authorities' views; `AdversaryAuxiliaryState` carries the adversary's own inputs/messages as *context, never output*; `SimulatedCorruptedAuthorityView`; `TrustedDealerShamirSimulator` (samples <t shares uniformly — valid precisely because <t Shamir shares are secret-independent; constructed from public data only, no R_EA,i anywhere in its API). |
 
 ### `src/zk/` — the exact-tally proof
@@ -323,11 +439,11 @@ receipt in a coercer's hands; it needs a separate treatment.
 | file | implements |
 |---|---|
 | `mod.rs` | `CircuitShape` (compile-time NB/NC/depth) and `SMALL_SHAPE` = (16, 3, 4), matching the compiled small circuit. |
-| `statement.rs` | `TallyStatement` — the public inputs and nothing else (eid_hash, MR, candidate-set commitment, bb_commitment, counts, sizes, rule id, pk_ea commitment); `build_tally_statement` from public data only. |
-| `witness.rs` | `TallyWitness`/`BallotWitnessRow` (per-ballot private inputs: ct, 9 plaintext fields, rho, R_EA, Merkle path). `build_tally_witness` mirrors FilterAndTally's decisions and applies the **dummy-substitution policy**: ballots whose contents would violate the circuit's *hard* constraints (unopenable, off-curve points, identity vk, non-canonical S) get safe dummy fields so the witness stays satisfiable while their validity flag is 0 — the same verdict native tallying reached. `padding_row`/`padded_rows` fill circuit slots beyond `num_ballots`. |
-| `mock_backend.rs` | `relation_check_native` — the native mirror of the circuit, constraint-for-constraint: soft flags (opening, eid, candidate, signature, Merkle root), hard-constraint failures reported as unsatisfiable, O(B²) duplicate logic, BB chain, tally equality. Includes `circuit_sig_ok` with **bit-exact integer scalar multiplication** (`mul_bits`) matching circomlib's `EscalarMulAny`/`EscalarMulFix` semantics. |
-| `circom_io.rs` | `generate_witness_input` — serializes (statement, witness) into the circuit's `input.json` (decimal strings, signal names matching the main component). |
-| `groth16_backend.rs` | `SnarkjsBackend` — Groth16 via the snarkjs CLI: artifact discovery (`toolchain_available`), `generate_witness` (wasm), `prove` → (proof.json, public.json), `verify`. Race-free per-call work directories. |
+| `statement.rs` | `TallyStatement` — the public inputs and nothing else (eid_hash, MR, candidate-set commitment, bb_commitment, counts, sizes, rule id, pk_ea commitment); `build_tally_statement` from public data only; `statement_matches_public_data` — the native check verifiers must run alongside the proof (binds `num_voters`/`pk_ea_commitment`, which the circuit cannot constrain). |
+| `witness.rs` | `TallyWitness`/`BallotWitnessRow` (per-ballot private inputs: ct, 9 plaintext fields, rho, R_EA, indexed row values reg_vk/reg_h, sibling path at index id — direction bits are id's own bits, not witness). Documents the **prover tiers** (Tier 1 single prover implemented; Tier 3 replaces the share-based `r_ea()` call with MPC). `build_tally_witness` mirrors FilterAndTally and applies the **dummy-substitution policy** for hard-constraint-unsafe ballots. `padding_row`/`padded_rows` fill circuit slots beyond `num_ballots`. |
+| `mock_backend.rs` | `relation_check_native` — the native mirror of the circuit, constraint-for-constraint: soft flags, deterministic strict-bits in-range flag, HARD gated indexed-row/root check (unsatisfiable ⇒ false), `batcher_schedule` (THE sorting-network schedule, shared with the circom side), sorted-record counting, BB chain, tally equality. Includes `circuit_sig_ok` with **bit-exact integer scalar multiplication** (`mul_bits`) matching circomlib semantics. |
+| `circom_io.rs` | `generate_witness_input` — serializes (statement, witness) into the circuit's `input.json` (decimal strings, signal names matching the main component); `statement_public_inputs`/`public_inputs_match` — the exact snarkjs `public.json` a proof of a statement must carry (verifiers reject proofs bound to any other statement). |
+| `groth16_backend.rs` | `SnarkjsBackend` — Groth16 via the snarkjs CLI: artifact discovery (`toolchain_available`), `generate_witness` (wasm), `prove` → (proof.json, public.json), `verify`. Race-free per-call work directories. `RapidsnarkBackend` — optional NATIVE prover (iden3 rapidsnark, C++): same .zkey/.wtns, ~12–14× faster prove step, proofs verify under the same snarkjs verification keys (`discover` via $RAPIDSNARK_PROVER or the build tree). |
 
 ### `src/disputes/` — private dispute resolution
 
@@ -335,21 +451,23 @@ receipt in a coercer's hands; it needs a separate treatment.
 |---|---|
 | `judge.rs` | `Verdict` (`AuthorityFaulty`/`VoterFaulty`/`BoardFaulty`/`Undetermined`) and `JudgeReport` — judge-private, never contains R_EA,i. |
 | `recorded_as_cast.rs` | Direct mode: `check_direct` (exact byte membership). Authority-mediated mode: `SubmissionReceipt` = `Sign_EA(eid, ballot_hash, timestamp)`, `ea_issue_receipt`, `verify_receipt`, and `adjudicate_recorded_as_cast` (valid receipt + missing bytes ⇒ `BoardFaulty`). |
-| `tallied_as_recorded.rs` | `judge_tallied_as_recorded` — the paper's checks 1–7: ballot opens to the claimed plaintext; signature verifies; `h = H_com(…, R, R_EA,i)` against the public record (**this is where a fake nonce is privately detected**); leaf/MR consistency (mismatch after a good h ⇒ `AuthorityFaulty`); duplicate status under the public rule; tally-proof verification. `NonceSource` lets the judge take R_EA,i directly from the EA or reconstruct it from ≥t threshold shares. |
+| `tallied_as_recorded.rs` | `judge_tallied_as_recorded` — the paper's checks 1–7: ballot opens to the claimed plaintext; signature verifies; `h = H_com(…, R, R_EA,i)` against the public record (**this is where a fake nonce is privately detected**); leaf/MR consistency (mismatch after a good h ⇒ `AuthorityFaulty`); duplicate status under the public rule; tally-proof status (`TallyProofStatus`: `Verified`/`Invalid`/`Unavailable` — a missing proof is never assumed valid). `NonceSource` lets the judge take R_EA,i directly from the EA or reconstruct it from ≥t threshold shares. |
 
 ### `circuits/` — the Circom side
 
 | file | implements |
 |---|---|
 | `components/poseidon_hashes.circom` | `HCom`, `HReg`, `MessageHashForSignature` — the three protocol hashes as Poseidon gadgets (arities 6/5/4, matching `crypto/hash.rs`). |
-| `components/merkle_membership.circom` | `MerkleMembership(depth)` — recomputes the root from leaf + path; **soft** `ok` output so non-membership invalidates the ballot instead of the whole witness. |
+| `components/merkle_membership.circom` | `MerkleMembership(depth)` — generic soft membership check (kept for reference; ballot validity now uses the HARD id-indexed row fetch inside `ballot_validity.circom`). |
 | `components/signature_verify.circom` | `SchnorrVerify` — in-circuit Schnorr: Poseidon challenge, `Num2Bits`, circomlib `EscalarMulAny` (c·A) and `EscalarMulFix` (S·Base8), `BabyAdd`, point equality as a soft flag; `BabyCheck` on-curve checks are the documented hard constraints. |
 | `components/encryption_decrypt.circom` | `CiphertextOpen(nFields)` — commitment-mode opening check (soft), plus the documented TODO for the BabyJubJub-ElGamal decryption swap (`ss = sk_EA·C1`). |
-| `components/ballot_validity.circom` | `BallotValidity(depth, nCand)` — wires opening ∧ eid ∧ candidate one-hot ∧ signature ∧ `HCom→HReg→Merkle` into one `valid` flag; exposes `voter_id` and the candidate selector. |
-| `components/duplicate_first_valid.circom` | `DuplicateFirstValid(nB)` — Strategy A, O(B²): `counted[j] = valid[j] · Π_{k<j}(1 − valid[k]·same_id(k,j))`; invalid ballots can never block. Strategy B (sorted witness) stubbed as TODO. |
+| `components/ballot_validity.circom` | `BallotValidity(depth, nCand)` — soft flags (opening ∧ eid ∧ candidate one-hot ∧ signature ∧ vk-match ∧ nonce-relation) × deterministic `in_range` (strict id bits) × active; HARD gated indexed-row fetch: leaf = HReg(eid, id, reg_vk, reg_h), Merkle directions = bits of id, root === MR. Emits the record fields (`valid`, `id_eff`, `m`, `candSel`). |
+| `components/duplicate_first_valid.circom` | `DuplicateFirstValid(nB)` — Strategy A (benchmark baseline), O(B²): `counted[j] = valid[j] · Π_{k<j}(1 − valid[k]·same_id(k,j))`; invalid ballots can never block. |
+| `components/sort_records.circom` | Strategy B permutation machinery: `CompareExchangeRecord` (packed key `(1-valid)·2^16 + id·2^8 + pos`, GreaterThan(17) + conditional swap) and `SortRecords(nB)` — Batcher odd-even mergesort network (schedule identical to `mock_backend::batcher_schedule`); sorted-by-construction = sound permutation + sortedness with no sampled challenge. |
+| `components/duplicate_sorted.circom` | `DuplicateTallySorted(nB, nC)` — Strategy B (MAIN): sort records, `counted_j = valid_sorted_j·(1 − same_id_prev)`, then `tally_counts[c] === Σ counted_j·[m_j = c]`. Sorted order stays private. |
 | `components/tally_accumulator.circom` | `TallyAccumulator(nB, nC)` — sums `counted·candSel` per candidate and constrains equality with the public `tally_counts`. |
-| `main/filter_and_tally.circom` | `FilterAndTally(nB, nC, depth)` — the whole relation: duplicate-rule pin, candidate-set commitment opening, `num_ballots` range + active flags, per-ballot validity, the BB Poseidon-chain binding, duplicates, tally. |
-| `main/filter_and_tally_small.circom` / `_medium.circom` | Instantiations: (16, 3, 4) ≈ 106k constraints, and (128, 3, 6). Public-input list declared here. |
+| `main/filter_and_tally.circom` | `FilterAndTally(nB, nC, depth, dupStrategy)` — the whole relation: duplicate-rule pin, candidate-set commitment opening, `num_ballots` range + active flags, per-ballot validity, the BB Poseidon-chain binding, duplicates, tally. |
+| `main/filter_and_tally_{small,medium}.circom` (+ `_naive`) | Instantiations of `FilterAndTally(nB, nC, depth, dupStrategy)`: small = (16,3,4) — 116,035 constraints (B) / 114,996 (A-naive); medium = (128,3,6) — 1,009,483 (B) / 1,008,548 (A). Public-input list declared here. |
 | `input_examples/*.json` | Ready-to-prove inputs: `small_valid_input.json` (real + fake + chaff) and `fake_before_real_input.json` (the critical invariant, provable). |
 
 ### `scripts/` — ZK toolchain
@@ -357,6 +475,7 @@ receipt in a coercer's hands; it needs a separate treatment.
 | file | does |
 |---|---|
 | `install_circom_deps.sh` | Installs circom 2 (cargo) and snarkjs + circomlib (npm, repo-local). |
+| `install_rapidsnark.sh` | Builds the optional rapidsnark NATIVE prover into `build/rapidsnark-src` (macOS links Homebrew GMP). Drop-in for the prove step only; snarkjs stays the witness generator and verifier. |
 | `compile_circuits.sh [small\|medium]` | `circom → r1cs + wasm + sym` into `build/circuits`, prints constraint counts. |
 | `setup_groth16.sh [variant]` | **Dev-only** setup: sizes the power of tau from the constraint count, generates a local ptau (new/contribute/prepare), Groth16 phase-2, exports the verification key. |
 | `prove.sh <input.json> [variant]` | Witness (wasm) + `snarkjs groth16 prove`. |
@@ -367,17 +486,23 @@ receipt in a coercer's hands; it needs a separate treatment.
 | file | covers |
 |---|---|
 | `setup_tests.rs` | Config validation; parameter consistency. |
-| `preprocessing_tests.rs` | Voter gets sk/R but never R_EA; h/leaf correctness; MR membership; duplicate-id rejection; cut-and-choose honest/cheating runs and the ≈1/q soundness estimate. |
+| `preprocessing_tests.rs` | State separation: `VoterState` cannot carry R_EA,i (exhaustive field list); authority state cannot recover R_i (no field, value absent from serialization); < t shares reconstruct nothing, ≥ t do; h/leaf correctness via authorized reconstruction; DENSE-id enforcement for the indexed table; duplicate-id rejection; cut-and-choose honest/cheating runs and the ≈1/q soundness estimate. |
 | `voting_tests.rs` | Real ballots count; candidate/registration guards; exact-byte ballot encoding. |
 | `fake_compliance_tests.rs` | Coercer-side signature verifies; fake rejected at the nonce relation; **fake-before-real doesn't block**; shape indistinguishability. |
 | `chaff_tests.rs` | Chaff rejected; same shape and rejection class as fakes; no markers. |
 | `filter_and_tally_tests.rs` | Every rejection path (decryption/format/eid/candidate/signature/wrong-key/nonce), duplicates, empty board. |
 | `duplicate_rule_tests.rs` | First-valid-counts; invalid ballots never consume slots; cross-voter independence. |
-| `zk_statement_tests.rs` | Native relation accepts valid witnesses, rejects wrong tallies and every tampered public input; witness flags match the tally; the statement leaks no identities/labels. |
+| `zk_statement_tests.rs` | Native relation accepts valid witnesses, rejects wrong tallies and every tampered public input; witness flags match the tally; the statement leaks no identities/labels; the prover cannot withhold/substitute an in-range ballot's registration path (hard indexed row ⇒ UNSAT); num_voters is relation-constrained. |
 | `groth16_integration_tests.rs` | Real prove+verify; tampered public input rejected; wrong tally unprovable; cross-instance mismatch rejected; proof/public contain no witness data. Skips cleanly if artifacts are absent. |
 | `dispute_tests.rs` | Recorded-as-cast present/absent/receipt; private fake-nonce detection; judge never leaks R_EA; threshold-share reconstruction path; duplicate complaints. |
 | `threshold_tests.rs` | Shamir t-of-k reconstruction; <t failure; simulator API takes no secrets; aux is context, not output; refuses ≥t corruptions. |
 | `negative_attack_tests.rs` | The broken-variant demonstrations: duplicates-before-validity enables vote cancellation; published identities leak forced abstention; leaked R_EA breaks fake compliance; public verdicts leak evasion. |
+
+### `benches/`
+
+| file | covers |
+|---|---|
+| `prover.rs` | Criterion benchmarks for the proving pipeline (see §6 “Benchmarks”): native stages (`filter_and_tally`, statement/witness building, native relation check, input serialization) and the real snarkjs stages (wasm witness generation, Groth16 prove, verify). The groth16 group skips cleanly if artifacts are absent. |
 
 ## 10. Design notes & compatibility
 

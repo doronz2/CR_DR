@@ -9,3 +9,4 @@ package-lock.json
 *.r1cs
 *.sym
 /election
+.DS_Store
