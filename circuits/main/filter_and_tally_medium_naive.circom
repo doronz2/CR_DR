@@ -1,6 +1,6 @@
 pragma circom 2.0.0;
 
-// Medium variant, Strategy B (sorted-record duplicates):
+// Medium variant, Strategy A (naive O(B^2) duplicates, benchmark baseline):
 // NUM_BALLOTS = 128, NUM_CANDIDATES = 3, MERKLE_DEPTH = 6 (NUM_VOTERS <= 64).
 // Compile with scripts/compile_circuits.sh medium.
 
@@ -18,4 +18,4 @@ component main {
         pk_ea_commitment,
         tally_counts
     ]
-} = FilterAndTally(128, 3, 6, 1);
+} = FilterAndTally(128, 3, 6, 0);

@@ -54,3 +54,29 @@ pub fn build_tally_statement(
         duplicate_rule_id: pp.duplicate_rule.id(),
     }
 }
+
+/// Check that a claimed statement is THE statement determined by the public
+/// election data (params, registration, board) — everything except the tally
+/// counts, which are what the proof attests to.
+///
+/// Verifiers MUST run this alongside the Groth16 proof check. In particular
+/// `pk_ea_commitment` is bound into the proof by the verification equation
+/// but is not otherwise constrained by the circuit, so its meaning comes
+/// from this native recomputation from public data. (`num_voters` IS
+/// circuit-constrained since the indexed registration table: it selects the
+/// in-range window of registration rows — this check additionally pins it
+/// to the actual public table size.)
+pub fn statement_matches_public_data(
+    statement: &TallyStatement,
+    pp: &PublicParams,
+    bb: &BulletinBoard,
+    registration_state: &RegistrationState,
+) -> bool {
+    let expected = build_tally_statement(
+        pp,
+        bb,
+        registration_state,
+        &TallyResult { counts: statement.tally_counts.clone(), counted_ballots: 0 },
+    );
+    *statement == expected && statement.tally_counts.len() == pp.candidates.len()
+}

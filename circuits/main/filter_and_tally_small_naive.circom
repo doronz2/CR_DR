@@ -1,8 +1,8 @@
 pragma circom 2.0.0;
 
-// Medium variant, Strategy B (sorted-record duplicates):
-// NUM_BALLOTS = 128, NUM_CANDIDATES = 3, MERKLE_DEPTH = 6 (NUM_VOTERS <= 64).
-// Compile with scripts/compile_circuits.sh medium.
+// Small variant, Strategy A (naive O(B^2) duplicates, benchmark baseline):
+// NUM_BALLOTS = 16, NUM_CANDIDATES = 3, MERKLE_DEPTH = 4 (NUM_VOTERS <= 16).
+// Matches cr_dr::zk::SMALL_SHAPE.
 
 include "./filter_and_tally.circom";
 
@@ -18,4 +18,4 @@ component main {
         pk_ea_commitment,
         tally_counts
     ]
-} = FilterAndTally(128, 3, 6, 1);
+} = FilterAndTally(16, 3, 4, 0);

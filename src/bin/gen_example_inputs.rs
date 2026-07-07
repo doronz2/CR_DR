@@ -4,6 +4,11 @@
 //!
 //! Both are full circom inputs (public inputs + private witness) for the
 //! small FilterAndTally(16, 3, 4) circuit.
+//!
+//! With `medium` as the first argument, additionally writes a full-board
+//! 128-slot input for the medium circuit to
+//! build/inputs/medium_valid_input.json (not checked in — benchmark /
+//! memory-measurement support).
 
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
@@ -31,19 +36,19 @@ fn main() -> anyhow::Result<()> {
     {
         let mut rng = ChaCha20Rng::seed_from_u64(41);
         let (pp, mut authority, reg, voters) = setup(&mut rng)?;
-        let mut bb = BulletinBoard::new();
+        let mut ballots = Vec::new();
         // real votes: candidates 0,1,1,2
         for (voter, cand) in voters.iter().take(4).zip([0u64, 1, 1, 2]) {
-            bb.append(cast_vote(&pp, &reg, voter, cand, &mut rng)?);
+            ballots.push(cast_vote(&pp, &reg, voter, cand, &mut rng)?);
         }
         // one fake-compliance ballot from voter 4 (never casts a real one)
         let t = fake_compliance(&pp, &voters[4], 2, &mut rng)?;
-        bb.append(build_fake_ballot(&pp, &t, &mut rng)?);
+        ballots.push(build_fake_ballot(&pp, &t, &mut rng)?);
         // two chaff ballots
-        bb.append(chaff_ballot(&pp, &mut rng)?);
-        bb.append(chaff_ballot(&pp, &mut rng)?);
+        ballots.push(chaff_ballot(&pp, &mut rng)?);
+        ballots.push(chaff_ballot(&pp, &mut rng)?);
 
-        write_input(&root, "small_valid_input.json", &pp, &authority, &reg, &bb)?;
+        write_input(&root, "small_valid_input.json", &pp, &authority, &reg, &ballots)?;
         let _ = &mut authority;
     }
 
@@ -51,18 +56,69 @@ fn main() -> anyhow::Result<()> {
     {
         let mut rng = ChaCha20Rng::seed_from_u64(42);
         let (pp, authority, reg, voters) = setup(&mut rng)?;
-        let mut bb = BulletinBoard::new();
+        let mut ballots = Vec::new();
         let coerced = &voters[0];
         // coercer's fake ballot first...
         let t = fake_compliance(&pp, coerced, 2, &mut rng)?;
-        bb.append(build_fake_ballot(&pp, &t, &mut rng)?);
+        ballots.push(build_fake_ballot(&pp, &t, &mut rng)?);
         // ...then the voter's real ballot, which must still count
-        bb.append(cast_vote(&pp, &reg, coerced, 0, &mut rng)?);
+        ballots.push(cast_vote(&pp, &reg, coerced, 0, &mut rng)?);
         // one more honest voter and a chaff ballot
-        bb.append(cast_vote(&pp, &reg, &voters[1], 1, &mut rng)?);
-        bb.append(chaff_ballot(&pp, &mut rng)?);
+        ballots.push(cast_vote(&pp, &reg, &voters[1], 1, &mut rng)?);
+        ballots.push(chaff_ballot(&pp, &mut rng)?);
 
-        write_input(&root, "fake_before_real_input.json", &pp, &authority, &reg, &bb)?;
+        write_input(&root, "fake_before_real_input.json", &pp, &authority, &reg, &ballots)?;
+    }
+
+    // ---- optional: medium full-board input (bench/memory support) ----
+    if std::env::args().nth(1).as_deref() == Some("medium") {
+        use cr_dr::zk::MEDIUM_SHAPE;
+        let mut rng = ChaCha20Rng::seed_from_u64(43);
+        let config = ElectionConfig {
+            eid: "example-election-medium".into(),
+            candidates: vec![0, 1, 2],
+            max_voters: 64,
+            max_ballots: 128,
+            merkle_depth: 6,
+            duplicate_rule: DuplicateRule::FirstValidCounts,
+            threshold_params: Some(cr_dr::types::ThresholdParams { t: 2, k: 3 }),
+        };
+        let (pp, mut authority) = setup_election(config, &mut rng)?;
+        let mut voters = Vec::new();
+        let mut records = Vec::new();
+        for id in 0..40u64 {
+            let (vs, rec) = preprocess_voter(&pp, &mut authority, id, &mut rng)?;
+            voters.push(vs);
+            records.push(rec);
+        }
+        let reg = finalize_registration(&pp, &records)?;
+        let mut ballots = Vec::new();
+        for v in voters.iter().take(5) {
+            let t = fake_compliance(&pp, v, 2, &mut rng)?;
+            ballots.push(build_fake_ballot(&pp, &t, &mut rng)?);
+            ballots.push(cast_vote(&pp, &reg, v, 0, &mut rng)?);
+        }
+        for (i, v) in voters.iter().enumerate().skip(5) {
+            ballots.push(cast_vote(&pp, &reg, v, 1 + (i as u64 % 2), &mut rng)?);
+        }
+        while ballots.len() < 128 {
+            ballots.push(chaff_ballot(&pp, &mut rng)?);
+        }
+
+        let mut bb = BulletinBoard::new();
+        for b in &ballots {
+            bb.append(b.public());
+        }
+        let (tally, _) = filter_and_tally(&pp, &authority, &reg, &ballots)?;
+        let statement = build_tally_statement(&pp, &bb, &reg, &tally);
+        let witness = build_tally_witness(&pp, &authority, &reg, &ballots)?;
+        assert!(relation_check_native(&statement, &witness, &MEDIUM_SHAPE));
+        let input = generate_witness_input(&statement, &witness, &MEDIUM_SHAPE)?;
+        let dir = root.join("build/inputs");
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("medium_valid_input.json");
+        std::fs::write(&path, serde_json::to_string_pretty(&input)?)?;
+        println!("wrote {} (tally: {:?})", path.display(), tally.counts);
     }
 
     Ok(())
@@ -103,11 +159,15 @@ fn write_input(
     pp: &cr_dr::types::PublicParams,
     authority: &cr_dr::types::AuthoritySecretState,
     reg: &cr_dr::protocol::preprocessing::RegistrationState,
-    bb: &BulletinBoard,
+    ballots: &[cr_dr::types::Ballot],
 ) -> anyhow::Result<()> {
-    let (tally, _) = filter_and_tally(pp, authority, reg, bb.list_public_ballots())?;
-    let statement = build_tally_statement(pp, bb, reg, &tally);
-    let witness = build_tally_witness(pp, authority, reg, bb.list_public_ballots())?;
+    let mut bb = BulletinBoard::new();
+    for b in ballots {
+        bb.append(b.public());
+    }
+    let (tally, _) = filter_and_tally(pp, authority, reg, ballots)?;
+    let statement = build_tally_statement(pp, &bb, reg, &tally);
+    let witness = build_tally_witness(pp, authority, reg, ballots)?;
     assert!(
         relation_check_native(&statement, &witness, &SMALL_SHAPE),
         "example must satisfy the native relation"

@@ -1,20 +1,38 @@
-//! Private witness for the FilterAndTally relation, built by the tallier
-//! (who holds the EA secret state).
+//! Private witness for the FilterAndTally relation, built by the tallier.
 //!
-//! The witness rows mirror the circuit's per-ballot private inputs. For
-//! ballots that cannot even be represented safely inside the circuit
+//! ## Prover tiers
+//!
+//! * **Tier 1 (this code, benchmarked)** — a single logical prover performs
+//!   an AUTHORIZED >= t reconstruction of each R_EA,i
+//!   (`AuthoritySecretState::r_ea`), assembles the full witness and runs
+//!   Groth16.
+//! * **Tier 2** — the same algorithm executed inside a protected, audited
+//!   environment; the interface is identical.
+//! * **Tier 3 (future)** — threshold authorities jointly provide the
+//!   witness without any single party learning everything. The only secret
+//!   that crosses a trust boundary here is R_EA,i, and it is consumed
+//!   through the share-based `r_ea()` interface, so a Tier-3 prover can
+//!   replace that call with an MPC opening without changing the relation.
+//!
+//! ## Row layout
+//!
+//! The witness rows mirror the circuit's per-ballot private inputs. The
+//! registration side is INDEXED: the ballot's claimed id determines the
+//! Merkle leaf index, so the row carries the public table row values
+//! (reg_vk, reg_h) and the sibling path AT INDEX id — the direction bits
+//! are the bits of id itself and are not part of the witness.
+//!
+//! For ballots that cannot even be represented safely inside the circuit
 //! (unopenable ciphertexts, off-curve/identity points, non-canonical
 //! scalars), the builder substitutes a fixed "dummy" plaintext whose point
-//! coordinates are valid curve points. The circuit's hard constraints
-//! (Poseidon computations, on-curve checks, bit decompositions) then remain
-//! satisfiable while the ballot's soft validity flag evaluates to 0 — the
-//! same verdict the native FilterAndTally reached.
+//! coordinates are valid curve points. The circuit's hard constraints then
+//! remain satisfiable while the ballot's soft validity flag evaluates to 0 —
+//! the same verdict the native FilterAndTally reached.
 
 use ark_ff::Zero;
 
 use crate::crypto::encryption::commit_open;
 use crate::crypto::hash::ct_commit;
-use crate::crypto::merkle::MerklePath;
 use crate::crypto::signature::{base8_circom_coords, decode_point, f_is_canonical_scalar};
 use crate::errors::{CrDrError, Result};
 use crate::protocol::preprocessing::RegistrationState;
@@ -31,8 +49,14 @@ pub struct BallotWitnessRow {
     pub pt_fields: [F; PLAINTEXT_FIELD_LEN],
     pub rho: F,
     pub r_ea: F,
+    /// Indexed registration row Reg[id] = (id, vk, h): vk coordinates and h.
+    /// Zeros when the claimed id is out of range (the circuit gates the row
+    /// check off in that case).
+    pub reg_vkx: F,
+    pub reg_vky: F,
+    pub reg_h: F,
+    /// Sibling hashes for leaf index id (direction bits = bits of id).
     pub merkle_path: Vec<F>,
-    pub merkle_index: Vec<bool>,
     /// Expected flags (recomputed, not trusted, by circuit and native
     /// relation checker; kept for tests).
     pub expect_valid: bool,
@@ -65,7 +89,8 @@ pub fn dummy_pt_fields() -> [F; PLAINTEXT_FIELD_LEN] {
 }
 
 /// A fully self-consistent padding row for circuit slots beyond
-/// `num_ballots` (its ct opens correctly, but the row is inactive).
+/// `num_ballots` (its ct opens correctly, but the row is inactive, so the
+/// indexed row check is gated off and zeros are fine).
 pub fn padding_row(depth: usize) -> BallotWitnessRow {
     let pt = dummy_pt_fields();
     BallotWitnessRow {
@@ -73,8 +98,10 @@ pub fn padding_row(depth: usize) -> BallotWitnessRow {
         pt_fields: pt,
         rho: F::zero(),
         r_ea: F::zero(),
+        reg_vkx: F::zero(),
+        reg_vky: F::zero(),
+        reg_h: F::zero(),
         merkle_path: vec![F::zero(); depth],
-        merkle_index: vec![false; depth],
         expect_valid: false,
         expect_counted: false,
     }
@@ -97,6 +124,7 @@ pub fn build_tally_witness(
     ballots: &[Ballot],
 ) -> Result<TallyWitness> {
     let depth = pp.merkle_depth;
+    let num_voters = registration_state.num_voters() as u64;
     let (_tally, evals) = crate::protocol::filter_and_tally::filter_and_tally(
         pp,
         authority_secret,
@@ -140,22 +168,21 @@ pub fn build_tally_witness(
             None => (dummy_pt_fields(), F::zero()),
         };
 
-        // Registration-side witness: real R_EA and Merkle path when the
-        // claimed (id, vk) matches a registered record, else zeros.
-        let (r_ea, path) = witness_registration_side(
-            authority_secret,
-            registration_state,
-            &pt_fields,
-            depth,
-        );
+        // Indexed registration side: the claimed id (real or dummy)
+        // determines the row. For in-range ids the row values and sibling
+        // path MUST be the true ones (hard constraints); out-of-range ids
+        // get zeros (constraints gated off).
+        let reg = registration_side(authority_secret, registration_state, &pt_fields, num_voters, depth);
 
         rows.push(BallotWitnessRow {
             ct,
             pt_fields,
             rho,
-            r_ea,
-            merkle_path: path.elements,
-            merkle_index: path.indices,
+            r_ea: reg.r_ea,
+            reg_vkx: reg.vkx,
+            reg_vky: reg.vky,
+            reg_h: reg.h,
+            merkle_path: reg.path,
             expect_valid: matches!(
                 eval.status,
                 crate::types::InternalBallotStatus::Counted
@@ -175,27 +202,49 @@ fn fields_points_safe(f: &[F; PLAINTEXT_FIELD_LEN]) -> bool {
     vk_ok && r_ok && f_is_canonical_scalar(&f[8])
 }
 
-fn witness_registration_side(
+struct RegSide {
+    r_ea: F,
+    vkx: F,
+    vky: F,
+    h: F,
+    path: Vec<F>,
+}
+
+/// The id-determined registration witness. In-range id => the true row
+/// Reg[id], its sibling path, and the authorized-reconstructed R_EA,id
+/// (supplied even when the ballot is invalid for other reasons — the row
+/// fetch is hard, the vk/nonce comparisons are soft). Out-of-range => zeros.
+fn registration_side(
     authority_secret: &AuthoritySecretState,
     registration_state: &RegistrationState,
     pt_fields: &[F; PLAINTEXT_FIELD_LEN],
+    num_voters: u64,
     depth: usize,
-) -> (F, MerklePath) {
-    let empty = MerklePath { elements: vec![F::zero(); depth], indices: vec![false; depth] };
+) -> RegSide {
+    let zeros = RegSide {
+        r_ea: F::zero(),
+        vkx: F::zero(),
+        vky: F::zero(),
+        h: F::zero(),
+        path: vec![F::zero(); depth],
+    };
     let Some(id) = crate::types::f_to_u64(&pt_fields[1]) else {
-        return (F::zero(), empty);
+        return zeros;
     };
-    let Some(record) = registration_state.record(id) else {
-        return (F::zero(), empty);
-    };
-    if record.vk.x != pt_fields[2] || record.vk.y != pt_fields[3] {
-        return (F::zero(), empty);
+    if id >= num_voters {
+        return zeros;
     }
-    let Some(secret) = authority_secret.voter_secrets.get(&id) else {
-        return (F::zero(), empty);
+    let Some(record) = registration_state.record(id) else {
+        return zeros; // unreachable for a well-formed dense table
     };
-    let path = registration_state.paths.get(&id).cloned().unwrap_or(empty);
-    (secret.r_ea, path)
+    let path = registration_state
+        .paths
+        .get(&id)
+        .map(|p| p.elements.clone())
+        .unwrap_or_else(|| vec![F::zero(); depth]);
+    // Authorized >= t quorum reconstruction; a registered row always has one.
+    let r_ea = authority_secret.r_ea(id).unwrap_or_else(|_| F::zero());
+    RegSide { r_ea, vkx: record.vk.x, vky: record.vk.y, h: record.h, path }
 }
 
 /// Pad witness rows out to the circuit's compile-time ballot count.

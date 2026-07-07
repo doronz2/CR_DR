@@ -1,14 +1,13 @@
 pragma circom 2.0.0;
 
-// Strategy A (required prototype): naive O(B^2) first-valid-counts.
+// Strategy A (benchmark baseline): naive O(B^2) first-valid-counts.
 // counted[j] = valid[j] AND no earlier VALID ballot with the same voter id.
 // Invalid ballots never block later ballots — the CRITICAL invariant.
 //
-// Strategy B (optional, future scaling) — TODO/stub:
-//   Sort valid ballots by (voter_id, board_index), prove the sort is a
-//   permutation (e.g. via a grand-product / permutation argument), then a
-//   single linear pass counts the first valid ballot per voter. Not needed
-//   for the small/medium prototype sizes.
+// The MAIN strategy is Strategy B (duplicate_sorted.circom): linear
+// sorted-record counting after an in-circuit sorting network. This
+// template is kept for the *_naive circuit variants so both strategies can
+// be compiled and benchmarked against each other.
 
 include "circomlib/circuits/comparators.circom";
 

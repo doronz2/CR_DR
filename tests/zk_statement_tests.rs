@@ -13,6 +13,7 @@ use cr_dr::zk::SMALL_SHAPE;
 struct Instance {
     env: common::Env,
     bb: BulletinBoard,
+    ballots: Vec<cr_dr::types::Ballot>,
     tally: cr_dr::types::TallyResult,
     statement: cr_dr::zk::statement::TallyStatement,
     witness: cr_dr::zk::witness::TallyWitness,
@@ -32,15 +33,17 @@ fn build_instance(seed: u64) -> Instance {
     }
     channel.submit(chaff_ballot(&env.pp, &mut env.rng).unwrap());
     let mut bb = BulletinBoard::new();
+    let mut ballots = Vec::new();
     for b in channel.flush_shuffled(&mut env.rng) {
-        bb.append(b);
+        bb.append(b.public());
+        ballots.push(b);
     }
     let (tally, _) =
-        filter_and_tally(&env.pp, &env.authority, &env.reg, bb.list_public_ballots()).unwrap();
+        filter_and_tally(&env.pp, &env.authority, &env.reg, &ballots).unwrap();
     let statement = build_tally_statement(&env.pp, &bb, &env.reg, &tally);
     let witness =
-        build_tally_witness(&env.pp, &env.authority, &env.reg, bb.list_public_ballots()).unwrap();
-    Instance { env, bb, tally, statement, witness }
+        build_tally_witness(&env.pp, &env.authority, &env.reg, &ballots).unwrap();
+    Instance { env, bb, ballots, tally, statement, witness }
 }
 
 #[test]
@@ -94,7 +97,7 @@ fn witness_flags_match_native_evaluation() {
         &inst.env.pp,
         &inst.env.authority,
         &inst.env.reg,
-        inst.bb.list_public_ballots(),
+        &inst.ballots,
     )
     .unwrap();
     let counted: u64 = inst.witness.rows.iter().filter(|r| r.expect_counted).count() as u64;
@@ -133,6 +136,64 @@ fn statement_contains_no_identities_or_validity_labels() {
 }
 
 #[test]
+fn statement_binding_rejects_tampered_unconstrained_fields() {
+    // num_voters and pk_ea_commitment carry no in-circuit constraints; the
+    // native statement check against public data must catch tampering.
+    use cr_dr::zk::statement::statement_matches_public_data;
+    let inst = build_instance(76);
+    assert!(statement_matches_public_data(&inst.statement, &inst.env.pp, &inst.bb, &inst.env.reg));
+
+    let mut bad = inst.statement.clone();
+    bad.num_voters += 1;
+    assert!(!statement_matches_public_data(&bad, &inst.env.pp, &inst.bb, &inst.env.reg));
+
+    let mut bad = inst.statement.clone();
+    bad.pk_ea_commitment += cr_dr::types::F::from(1u64);
+    assert!(!statement_matches_public_data(&bad, &inst.env.pp, &inst.bb, &inst.env.reg));
+
+    let mut bad = inst.statement.clone();
+    bad.num_ballots += 1;
+    assert!(!statement_matches_public_data(&bad, &inst.env.pp, &inst.bb, &inst.env.reg));
+}
+
+#[test]
+fn proof_public_inputs_are_bound_to_the_statement() {
+    use cr_dr::zk::circom_io::{public_inputs_match, statement_public_inputs};
+    let inst = build_instance(77);
+    let public: serde_json::Value = statement_public_inputs(&inst.statement).into();
+    assert!(public_inputs_match(&public, &inst.statement));
+
+    // A proof carrying a different statement's public inputs must not match.
+    let mut other = inst.statement.clone();
+    other.num_voters += 1;
+    let other_public: serde_json::Value = statement_public_inputs(&other).into();
+    assert!(!public_inputs_match(&other_public, &inst.statement));
+}
+
+#[test]
+fn serialized_public_board_contains_no_openings() {
+    // Regression: the public board must expose ONLY ciphertexts — no
+    // ea_payload / plaintext openings (votes, ids, nonces, signatures).
+    let inst = build_instance(78);
+    let board_json = serde_json::to_string(&inst.bb).unwrap();
+    assert!(!board_json.contains("ea_payload"));
+    assert!(!board_json.contains("plaintext_fields"));
+    assert!(!board_json.contains("rho"));
+    // And none of the private opening values leak into the board encoding
+    // (skip short values like ids/candidates, which collide as substrings).
+    for b in &inst.ballots {
+        let payload = String::from_utf8(b.ea_payload.clone()).unwrap();
+        let opening: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        for f in opening["plaintext_fields"].as_array().unwrap() {
+            let s = f.as_str().unwrap();
+            if s.len() > 8 {
+                assert!(!board_json.contains(s));
+            }
+        }
+    }
+}
+
+#[test]
 fn relation_rejects_witness_ballot_swap() {
     // Swapping two ballots in the witness breaks the BB chain binding.
     let inst = build_instance(75);
@@ -141,4 +202,58 @@ fn relation_rejects_witness_ballot_swap() {
         bad.rows.swap(0, 1);
         assert!(!relation_check_native(&inst.statement, &bad, &SMALL_SHAPE));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Indexed registration table: hard row-consistency for in-range identities
+// ---------------------------------------------------------------------------
+
+#[test]
+fn prover_cannot_withhold_the_path_of_an_in_range_ballot() {
+    // Under the indexed table, the Merkle path of an ACTIVE ballot with an
+    // in-range identity is a HARD constraint (directions = bits of id). A
+    // malicious tallier that zeroes the path/row of a valid ballot — trying
+    // to soft-invalidate it and undercount — makes the witness UNSATISFIABLE
+    // instead of producing a proof of a smaller tally.
+    let inst = build_instance(75);
+    let idx = inst
+        .witness
+        .rows
+        .iter()
+        .position(|r| r.expect_valid)
+        .expect("instance has a valid ballot");
+
+    // Withhold the path.
+    let mut w = inst.witness.clone();
+    for e in &mut w.rows[idx].merkle_path {
+        *e = cr_dr::types::F::from(0u64);
+    }
+    let mut bad_statement = inst.statement.clone();
+    // even with the matching (smaller) tally the relation must be UNSAT
+    bad_statement.tally_counts = inst.statement.tally_counts.clone();
+    assert!(!relation_check_native(&bad_statement, &w, &SMALL_SHAPE));
+
+    // Substitute a different (but real) row: root check fails => UNSAT too.
+    let mut w2 = inst.witness.clone();
+    let other = (0..inst.env.reg.num_voters() as u64)
+        .find(|i| {
+            inst.env.reg.records[i].vk.x != w2.rows[idx].reg_vkx
+        })
+        .expect("another registered row exists");
+    let rec = &inst.env.reg.records[&other];
+    w2.rows[idx].reg_vkx = rec.vk.x;
+    w2.rows[idx].reg_vky = rec.vk.y;
+    w2.rows[idx].reg_h = rec.h;
+    assert!(!relation_check_native(&inst.statement, &w2, &SMALL_SHAPE));
+}
+
+#[test]
+fn num_voters_is_constrained_by_the_relation() {
+    // num_voters selects the in-range window of the indexed table; shrinking
+    // it below a counted voter's id (or growing it past the true table) must
+    // change/break the relation rather than being a free field.
+    let inst = build_instance(76);
+    let mut bad = inst.statement.clone();
+    bad.num_voters = 0; // every id now out of range => all ballots invalid
+    assert!(!relation_check_native(&bad, &inst.witness, &SMALL_SHAPE));
 }

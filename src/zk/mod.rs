@@ -1,3 +1,4 @@
+pub mod chunked;
 pub mod circom_io;
 pub mod groth16_backend;
 pub mod mock_backend;
@@ -17,3 +18,7 @@ pub struct CircuitShape {
 /// Shape of the checked-in "small" circuit variant.
 pub const SMALL_SHAPE: CircuitShape =
     CircuitShape { num_ballots: 16, num_candidates: 3, merkle_depth: 4 };
+
+/// Shape of the "medium" circuit variant.
+pub const MEDIUM_SHAPE: CircuitShape =
+    CircuitShape { num_ballots: 128, num_candidates: 3, merkle_depth: 6 };
