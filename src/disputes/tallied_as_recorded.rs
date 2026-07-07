@@ -9,12 +9,12 @@
 //! be a receipt), and its detailed report is judge-private.
 
 use crate::crypto::encryption::{commit_open, EncOpening};
-use crate::crypto::hash::{h_com, h_reg, sig_msg_hash};
-use crate::crypto::merkle::verify_path;
+use crate::crypto::hash::sig_msg_hash;
 use crate::crypto::shamir::Share;
 use crate::crypto::signature::verify;
 use crate::disputes::judge::{JudgeReport, Verdict};
 use crate::protocol::bulletin_board::BulletinBoard;
+use crate::protocol::filter_and_tally::{registration_check, RegistrationCheck};
 use crate::protocol::preprocessing::RegistrationState;
 use crate::types::{Ballot, BallotPlaintext, F, InternalBallotStatus, PublicParams};
 
@@ -34,14 +34,29 @@ pub struct TalliedAsRecordedComplaint {
     pub opening: EncOpening,
 }
 
+/// Outcome of checking the public tally proof, as established by the judge.
+/// A proof only counts as `Verified` if it cryptographically verifies AND its
+/// public inputs are the current public statement — a proof for some other
+/// statement proves nothing about this tally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TallyProofStatus {
+    /// Proof verifies against the current public statement.
+    Verified,
+    /// A proof was checked and it does not verify (or it is bound to a
+    /// different statement than the current public one).
+    Invalid,
+    /// No proof (or no verifier) was available; nothing was checked.
+    Unavailable,
+}
+
 /// Evidence the judge obtains from the authority side.
 pub struct AuthorityEvidence<'a> {
     pub nonce_source: NonceSource,
     /// Internal evaluations of the ballots preceding the complained ballot
     /// on the board (judge-private; needed for duplicate adjudication).
     pub prior_evaluations: &'a [crate::types::InternalBallotEvaluation],
-    /// Whether the public tally proof verified against the public statement.
-    pub tally_proof_valid: bool,
+    /// Status of the public tally proof check.
+    pub tally_proof: TallyProofStatus,
 }
 
 /// Adjudicate a tallied-as-recorded complaint.
@@ -56,7 +71,7 @@ pub fn judge_tallied_as_recorded(
     let Some(board_index) = bb
         .list_public_ballots()
         .iter()
-        .position(|b| b.bytes == complaint.ballot.bytes)
+        .position(|b| b.ciphertext == complaint.ballot.ciphertext)
     else {
         return JudgeReport::new(
             Verdict::Undetermined,
@@ -91,15 +106,12 @@ pub fn judge_tallied_as_recorded(
         return JudgeReport::new(Verdict::VoterFaulty, "invalid signature");
     }
 
-    // Public registration record.
-    let Some(record) = registration_state.record(pt.id) else {
-        return JudgeReport::new(Verdict::VoterFaulty, "voter id not registered");
-    };
-    if record.vk != pt.vk {
-        return JudgeReport::new(Verdict::VoterFaulty, "vk does not match registration");
-    }
-
-    // (3-5) hidden nonce relation, using the judge-private R_EA,i.
+    // (3-5) the SAME deterministic indexed-registration predicate the tally
+    // relation uses (protocol::filter_and_tally::registration_check): the
+    // claimed id selects row Reg[id]; vk equality; hidden nonce relation;
+    // leaf/root consistency. R_EA,i is judge-private (direct from the
+    // logical EA or reconstructed from >= t threshold shares) and is used
+    // only inside this check — it never appears in the report.
     let r_ea = match &evidence.nonce_source {
         NonceSource::Direct(v) => *v,
         NonceSource::ThresholdShares(shares) => match crate::crypto::shamir::reconstruct(shares) {
@@ -112,29 +124,33 @@ pub fn judge_tallied_as_recorded(
             }
         },
     };
-    let h = h_com(pt.eid_hash, pt.id, &pt.vk, pt.r, r_ea);
-    if h != record.h {
-        // The registered commitment does not open to the voter's claimed R:
-        // the voter presented a fake nonce (this is exactly the private
-        // detection of a fake-compliance ballot).
-        return JudgeReport::new(
-            Verdict::VoterFaulty,
-            "hidden nonce relation fails: claimed R is not the registered nonce",
-        );
-    }
-    let leaf = h_reg(pt.eid_hash, pt.id, &pt.vk, h);
-    let in_tree = registration_state
-        .paths
-        .get(&pt.id)
-        .map(|p| verify_path(registration_state.root, leaf, p))
-        .unwrap_or(false);
-    if leaf != record.leaf || !in_tree {
-        // The nonce relation holds against the public h, but registration
-        // data is inconsistent with the Merkle root: authority-side fault.
-        return JudgeReport::new(
-            Verdict::AuthorityFaulty,
-            "registration leaf inconsistent with the published root",
-        );
+    match registration_check(pp, registration_state, &pt, r_ea) {
+        RegistrationCheck::Ok => {}
+        RegistrationCheck::NotRegistered => {
+            return JudgeReport::new(Verdict::VoterFaulty, "voter id not a registered row");
+        }
+        RegistrationCheck::VkMismatch => {
+            return JudgeReport::new(Verdict::VoterFaulty, "vk does not match registration row");
+        }
+        RegistrationCheck::NonceMismatch => {
+            // The registered commitment does not open to the voter's claimed
+            // R: the voter presented a fake nonce (this is exactly the
+            // PRIVATE detection of a fake-compliance ballot). The verdict is
+            // voter-fault / no-authority-fault; neither R_EA,i nor any
+            // validity label leaves the judge.
+            return JudgeReport::new(
+                Verdict::VoterFaulty,
+                "hidden nonce relation fails: claimed R is not the registered nonce",
+            );
+        }
+        RegistrationCheck::LeafInconsistent => {
+            // The nonce relation holds against the public h, but the indexed
+            // row is inconsistent with the Merkle root: authority-side fault.
+            return JudgeReport::new(
+                Verdict::AuthorityFaulty,
+                "registration leaf inconsistent with the published root",
+            );
+        }
     }
 
     // (6) duplicate status under the public rule.
@@ -150,16 +166,23 @@ pub fn judge_tallied_as_recorded(
         );
     }
 
-    // (7) the ballot is valid and first: it must have been counted.
-    if !evidence.tally_proof_valid {
-        return JudgeReport::new(
+    // (7) the ballot is valid and first: it must have been counted. Whether
+    // it actually was rests entirely on the tally proof, so an unchecked
+    // proof must NOT be assumed valid.
+    match evidence.tally_proof {
+        TallyProofStatus::Invalid => JudgeReport::new(
             Verdict::AuthorityFaulty,
             "valid first ballot, and the public tally proof does not verify",
-        );
+        ),
+        TallyProofStatus::Unavailable => JudgeReport::new(
+            Verdict::Undetermined,
+            "valid first ballot, but no tally proof was checked against the current \
+             statement; cannot conclude the ballot was counted",
+        ),
+        TallyProofStatus::Verified => JudgeReport::new(
+            Verdict::Undetermined,
+            "valid first ballot and a verifying tally proof: under proof soundness the ballot \
+             was counted; no fault identified",
+        ),
     }
-    JudgeReport::new(
-        Verdict::Undetermined,
-        "valid first ballot and a verifying tally proof: under proof soundness the ballot \
-         was counted; no fault identified",
-    )
 }

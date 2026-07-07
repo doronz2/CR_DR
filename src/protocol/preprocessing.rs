@@ -1,7 +1,42 @@
-//! Voter preprocessing (registration) — plain and cut-and-choose variants —
-//! and registration finalization (Merkle tree over registration leaves).
+//! Threshold-private voter preprocessing (registration) — plain and
+//! cut-and-choose variants — and registration finalization (indexed Merkle
+//! tree over registration leaves).
 //!
-//! The voter receives (sk_i, vk_i, R_i) and NEVER receives R_EA,i.
+//! ## Trust model (single logical EA, threshold authorities)
+//!
+//! Preprocessing is modeled as an IDEALIZED private functionality F_prep
+//! between the voter and the k threshold authorities:
+//!
+//!   * the VOTER samples and keeps (sk_i, vk_i, R_i) — `voter_registration_
+//!     secrets`. R_i is never an input to any authority-side state.
+//!   * the AUTHORITY side threshold-generates R_EA,i: F_prep samples it,
+//!     immediately Shamir-shares it t-of-k, hands share j to authority j,
+//!     and ERASES the plain value. No below-threshold coalition (< t
+//!     authorities) learns anything about R_EA,i (< t Shamir shares are
+//!     distributed independently of the secret) — and no authority ever
+//!     sees R_i.
+//!   * F_prep computes the public commitment
+//!         h_i = H_com(eid, i, vk_i, R_i, R_EA,i)
+//!     (only the functionality ever holds both nonces together) and outputs
+//!     the public row (i, vk_i, h_i, leaf_i).
+//!
+//! This file implements F_prep directly (research prototype — not a full
+//! MPC protocol); the STATE SEPARATION is the theorem-relevant part:
+//! `VoterState` = (sk_i, vk_i, R_i) only, `AuthorityVoterSecret` = shares of
+//! R_EA,i only, and the public table = (i, vk_i, h_i, leaf_i) only. The
+//! below-threshold simulatability claim is exercised by
+//! `threshold::malicious_view_model`.
+//!
+//! ## Indexed registration table
+//!
+//! Registration is an INDEXED public table: voter id i IS the Merkle leaf
+//! index. `finalize_registration` therefore requires the registered ids to
+//! be exactly 0..N-1, and
+//!     Reg[i] = (i, vk_i, h_i),
+//!     leaf_i = H_reg(eid, i, vk_i, h_i),
+//!     MR     = MerkleRoot(leaf_0, ..., leaf_{N-1}).
+//! A ballot claiming identity i is checked against row i and no other row —
+//! the tally prover is not free to pick a different leaf/path for it.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -10,15 +45,41 @@ use rand::{CryptoRng, Rng, RngCore};
 
 use crate::crypto::hash::{h_com, h_reg};
 use crate::crypto::merkle::{MerklePath, MerkleTree};
-use crate::crypto::signature::keygen;
+use crate::crypto::shamir::share;
+use crate::crypto::signature::{keygen, SecretKey, VerificationKey};
 use crate::errors::{CrDrError, Result};
 use crate::types::{
     AuthoritySecretState, AuthorityVoterSecret, F, Nonce, PublicParams,
-    PublicRegistrationRecord, VoterId, VoterState,
+    PublicRegistrationRecord, ThresholdParams, VoterId, VoterState,
 };
 
-/// Register one voter. Returns the voter's private state and the public
-/// registration record. R_EA,i is stored only in the authority secret state.
+/// VOTER-SIDE registration secrets. The voter samples all three values
+/// locally; none of them is an input to the authority side.
+#[derive(Debug, Clone)]
+pub struct VoterRegistrationSecrets {
+    pub sk: SecretKey,
+    pub vk: VerificationKey,
+    pub r: Nonce,
+}
+
+/// Voter-side sampling of (sk_i, vk_i, R_i).
+pub fn voter_registration_secrets<R: RngCore + CryptoRng>(
+    rng: &mut R,
+) -> VoterRegistrationSecrets {
+    let (sk, vk) = keygen(rng);
+    VoterRegistrationSecrets { sk, vk, r: F::rand(rng) }
+}
+
+/// Threshold parameters in effect for nonce sharing.
+fn nonce_threshold(pp: &PublicParams) -> ThresholdParams {
+    pp.threshold_params.unwrap_or(ThresholdParams::single())
+}
+
+/// Register one voter — the idealized functionality F_prep (see module
+/// docs). Returns the voter's private state and the public registration
+/// record. The authority state receives ONLY Shamir shares of R_EA,i; the
+/// plain nonce is erased before this function returns, and R_i never enters
+/// the authority state at all.
 pub fn preprocess_voter<R: RngCore + CryptoRng>(
     pp: &PublicParams,
     authority_secret: &mut AuthoritySecretState,
@@ -31,29 +92,44 @@ pub fn preprocess_voter<R: RngCore + CryptoRng>(
     if authority_secret.voter_secrets.len() >= pp.max_voters {
         return Err(CrDrError::InvalidConfig("max_voters exceeded".into()));
     }
+    if voter_id >= pp.max_voters as u64 {
+        return Err(CrDrError::InvalidConfig(format!(
+            "voter id {voter_id} out of the indexed range 0..{}",
+            pp.max_voters
+        )));
+    }
 
-    let (sk, vk) = keygen(rng);
-    let r: Nonce = F::rand(rng);
+    // Voter side: the voter samples and keeps (sk, vk, R_i).
+    let voter = voter_registration_secrets(rng);
+
+    // Authority side, inside F_prep: threshold-generate R_EA,i.
+    let tp = nonce_threshold(pp);
     let r_ea: Nonce = F::rand(rng);
+    let r_ea_shares = share(r_ea, tp.t, tp.k, rng)?;
 
-    let h = h_com(pp.eid_hash, voter_id, &vk, r, r_ea);
-    let leaf = h_reg(pp.eid_hash, voter_id, &vk, h);
+    // Only F_prep holds R_i and R_EA,i together, exactly long enough to
+    // compute the binding-and-hiding public commitment h_i.
+    let h = h_com(pp.eid_hash, voter_id, &voter.vk, voter.r, r_ea);
+    let leaf = h_reg(pp.eid_hash, voter_id, &voter.vk, h);
+    let _ = r_ea; // erased: from here on only shares exist
 
     authority_secret.voter_secrets.insert(
         voter_id,
-        AuthorityVoterSecret { id: voter_id, vk, r, r_ea },
+        AuthorityVoterSecret { id: voter_id, vk: voter.vk, r_ea_shares },
     );
 
     Ok((
-        VoterState { id: voter_id, sk, vk, r },
-        PublicRegistrationRecord { id: voter_id, vk, h, leaf },
+        VoterState { id: voter_id, sk: voter.sk, vk: voter.vk, r: voter.r },
+        PublicRegistrationRecord { id: voter_id, vk: voter.vk, h, leaf },
     ))
 }
 
-/// Finalized public registration state.
+/// Finalized public registration state: the INDEXED table Reg[0..N-1] and
+/// its Merkle tree. Contains only public data.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RegistrationState {
-    /// Records ordered by voter id; leaf index = position in this order.
+    /// Records ordered by voter id. Ids are dense: record i sits at Merkle
+    /// leaf index i (the ballot identity determines the leaf index).
     pub records: BTreeMap<VoterId, PublicRegistrationRecord>,
     pub leaf_index: HashMap<VoterId, usize>,
     #[serde(with = "crate::types::fserde")]
@@ -66,9 +142,16 @@ impl RegistrationState {
     pub fn record(&self, id: VoterId) -> Option<&PublicRegistrationRecord> {
         self.records.get(&id)
     }
+
+    /// Number of registered voters N (rows 0..N-1).
+    pub fn num_voters(&self) -> usize {
+        self.records.len()
+    }
 }
 
-/// Build the Merkle tree over registration leaves (sorted by voter id).
+/// Build the Merkle tree over registration leaves. The registered ids must
+/// be exactly 0..N-1: the table is INDEXED (leaf index = voter id), so a
+/// ballot's claimed identity deterministically selects its registration row.
 pub fn finalize_registration(
     pp: &PublicParams,
     records: &[PublicRegistrationRecord],
@@ -79,11 +162,20 @@ pub fn finalize_registration(
             return Err(CrDrError::DuplicateVoter(rec.id));
         }
     }
+    for (expected, id) in map.keys().enumerate() {
+        if *id != expected as u64 {
+            return Err(CrDrError::InvalidConfig(format!(
+                "registration ids must be dense 0..N-1 (indexed table); \
+                 missing id {expected}, found {id}"
+            )));
+        }
+    }
     let leaves: Vec<F> = map.values().map(|r| r.leaf).collect();
     let tree = MerkleTree::new(&leaves, pp.merkle_depth)?;
     let mut leaf_index = HashMap::new();
     let mut paths = HashMap::new();
     for (i, id) in map.keys().enumerate() {
+        debug_assert_eq!(i as u64, *id);
         leaf_index.insert(*id, i);
         paths.insert(*id, tree.path(i)?);
     }
@@ -100,10 +192,13 @@ pub fn finalize_registration(
 // Cut-and-choose preprocessing
 // ---------------------------------------------------------------------------
 //
-// Models the audit intuition only: the authority commits to q candidate
-// (R^k, R_EA^k) pairs; the voter audits q-1 of them (authority opens R_EA^k
-// and the voter recomputes h^k); the unopened pair becomes the voting pair.
-// A cheating authority that corrupts one pair survives with probability ~1/q.
+// Models the audit intuition only: the authority side commits to q candidate
+// R_EA^k values via h^k = H_com(eid, i, vk, R_i, R_EA^k) (computed inside
+// F_prep — the voter's R_i is fixed across candidates and never given to the
+// authorities); the voter audits q-1 of them (the authority opens R_EA^k and
+// the voter recomputes h^k); the unopened pair becomes the voting pair and
+// its R_EA is threshold-shared like in the plain flow. A cheating authority
+// that corrupts one pair survives with probability ~1/q.
 //
 // THIS IS NOT a full malicious VSS/DKG — see README.
 
@@ -164,24 +259,27 @@ fn preprocess_voter_cut_and_choose_impl<R: RngCore + CryptoRng>(
     if authority_secret.voter_secrets.contains_key(&voter_id) {
         return Err(CrDrError::DuplicateVoter(voter_id));
     }
+    if voter_id >= pp.max_voters as u64 {
+        return Err(CrDrError::InvalidConfig(format!(
+            "voter id {voter_id} out of the indexed range 0..{}",
+            pp.max_voters
+        )));
+    }
 
-    let (sk, vk) = keygen(rng);
+    // Voter side: (sk, vk, R_i) — R_i fixed across all q candidates.
+    let voter = voter_registration_secrets(rng);
 
-    // Authority generates q candidate pairs and commits to h^k.
-    // The voter learns all R^k; the authority keeps all R_EA^k for now.
-    let mut r_candidates = Vec::with_capacity(q);
+    // Authority side generates q candidate R_EA^k; F_prep commits to each.
     let mut r_ea_candidates = Vec::with_capacity(q);
     let mut commitments = Vec::with_capacity(q);
     for k in 0..q {
-        let r = F::rand(rng);
         let r_ea = F::rand(rng);
-        let mut h = h_com(pp.eid_hash, voter_id, &vk, r, r_ea);
+        let mut h = h_com(pp.eid_hash, voter_id, &voter.vk, voter.r, r_ea);
         if corrupt_index == Some(k) {
             // A cheating authority publishes a commitment that does not match
             // the pair it will later use/open.
             h += F::from(1u64);
         }
-        r_candidates.push(r);
         r_ea_candidates.push(r_ea);
         commitments.push(h);
     }
@@ -193,8 +291,9 @@ fn preprocess_voter_cut_and_choose_impl<R: RngCore + CryptoRng>(
         if k == final_index {
             continue;
         }
-        // Authority opens R_EA^k; voter recomputes h^k.
-        let recomputed = h_com(pp.eid_hash, voter_id, &vk, r_candidates[k], r_ea_candidates[k]);
+        // Authority opens R_EA^k; the voter recomputes h^k with their R_i.
+        let recomputed =
+            h_com(pp.eid_hash, voter_id, &voter.vk, voter.r, r_ea_candidates[k]);
         if recomputed != commitments[k] {
             return Err(CrDrError::CutAndChooseAudit(format!(
                 "pair {k} opening does not match its commitment (evidence: voter id {voter_id})"
@@ -203,19 +302,22 @@ fn preprocess_voter_cut_and_choose_impl<R: RngCore + CryptoRng>(
         opened.push((k, r_ea_candidates[k]));
     }
 
-    let r = r_candidates[final_index];
-    let r_ea = r_ea_candidates[final_index];
     let h = commitments[final_index];
-    let leaf = h_reg(pp.eid_hash, voter_id, &vk, h);
+    let leaf = h_reg(pp.eid_hash, voter_id, &voter.vk, h);
+
+    // Threshold-share the final R_EA and erase the plain value.
+    let tp = nonce_threshold(pp);
+    let r_ea_shares = share(r_ea_candidates[final_index], tp.t, tp.k, rng)?;
+    drop(r_ea_candidates);
 
     authority_secret.voter_secrets.insert(
         voter_id,
-        AuthorityVoterSecret { id: voter_id, vk, r, r_ea },
+        AuthorityVoterSecret { id: voter_id, vk: voter.vk, r_ea_shares },
     );
 
     Ok((
-        VoterState { id: voter_id, sk, vk, r },
-        PublicRegistrationRecord { id: voter_id, vk, h, leaf },
+        VoterState { id: voter_id, sk: voter.sk, vk: voter.vk, r: voter.r },
+        PublicRegistrationRecord { id: voter_id, vk: voter.vk, h, leaf },
         CutAndChooseTranscript { q, final_index, commitments, opened },
     ))
 }

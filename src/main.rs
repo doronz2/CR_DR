@@ -8,10 +8,11 @@
 //!   public/params.json           public parameters
 //!   public/registration_records.json   appended by register-voter
 //!   public/registration.json     Merkle tree state (after finalize)
-//!   public/board.json            the bulletin board
+//!   public/board.json            the bulletin board (ciphertexts ONLY)
 //!   public/tally.json            public tally
 //!   public/statement.json        public ZK statement
 //!   authority/secret.json        EA SECRET state (R_EA,i live here)
+//!   authority/ballot_payloads.json  EA SECRET per-ballot payloads (openings)
 //!   voters/<id>.json             per-voter SECRET state (sk_i, R_i)
 //!   channel.json                 pending anonymous-channel submissions
 //!   proofs/proof.json,public.json
@@ -33,26 +34,29 @@ use cr_dr::disputes::recorded_as_cast::{
 };
 use cr_dr::disputes::tallied_as_recorded::{
     judge_tallied_as_recorded, AuthorityEvidence, NonceSource, TalliedAsRecordedComplaint,
+    TallyProofStatus,
 };
 use cr_dr::protocol::bulletin_board::{AnonymousChannel, BulletinBoard};
 use cr_dr::protocol::chaff::chaff_ballot;
 use cr_dr::protocol::fake_compliance::{
     build_fake_ballot, fake_compliance, FakeComplianceTranscript,
 };
-use cr_dr::protocol::filter_and_tally::filter_and_tally;
+use cr_dr::protocol::filter_and_tally::{assemble_ea_ballots, filter_and_tally};
 use cr_dr::protocol::preprocessing::{
     finalize_registration, preprocess_voter, preprocess_voter_cut_and_choose, RegistrationState,
 };
 use cr_dr::protocol::setup::setup_election;
 use cr_dr::protocol::vote::cast_vote;
 use cr_dr::types::{
-    AuthoritySecretState, Ballot, DuplicateRule, ElectionConfig, PublicParams,
-    PublicRegistrationRecord, TallyResult, ThresholdParams, VoterState,
+    AuthorityBallotPayloads, AuthoritySecretState, Ballot, DuplicateRule, ElectionConfig,
+    PublicParams, PublicRegistrationRecord, TallyResult, ThresholdParams, VoterState,
 };
-use cr_dr::zk::circom_io::generate_witness_input;
+use cr_dr::zk::circom_io::{generate_witness_input, public_inputs_match};
 use cr_dr::zk::groth16_backend::SnarkjsBackend;
 use cr_dr::zk::mock_backend::relation_check_native;
-use cr_dr::zk::statement::{build_tally_statement, TallyStatement};
+use cr_dr::zk::statement::{
+    build_tally_statement, statement_matches_public_data, TallyStatement,
+};
 use cr_dr::zk::witness::build_tally_witness;
 use cr_dr::zk::SMALL_SHAPE;
 
@@ -240,6 +244,9 @@ impl Paths {
     }
     fn authority(&self) -> PathBuf {
         self.dir.join("authority/secret.json")
+    }
+    fn authority_payloads(&self) -> PathBuf {
+        self.dir.join("authority/ballot_payloads.json")
     }
     fn voter(&self, id: u64) -> PathBuf {
         self.dir.join(format!("voters/{id}.json"))
@@ -429,22 +436,29 @@ fn main() -> Result<()> {
         Cmd::FlushChannel => {
             let mut channel: AnonymousChannel = read_json_or_default(&paths.channel())?;
             let mut board: BulletinBoard = read_json_or_default(&paths.board())?;
+            let mut payloads: AuthorityBallotPayloads =
+                read_json_or_default(&paths.authority_payloads())?;
             let ballots = channel.flush_shuffled(&mut rng);
             let n = ballots.len();
+            // Only the ciphertext is posted publicly; the EA payload (in
+            // commitment mode: the full opening) goes to the EA's private
+            // store, aligned with board order.
             for b in ballots {
-                board.append(b);
+                board.append(b.public());
+                payloads.payloads.push(b.ea_payload);
             }
             write_json(&paths.board(), &board)?;
+            write_json(&paths.authority_payloads(), &payloads)?;
             write_json(&paths.channel(), &channel)?;
             println!("{n} ballot(s) posted to the board in shuffled order (bytes preserved)");
-            println!("board now holds {} ballot(s)", board.len());
+            println!("board now holds {} ballot(s); EA payloads stored privately", board.len());
         }
 
         Cmd::ShowBoard => {
             let board: BulletinBoard = read_json_or_default(&paths.board())?;
             println!("bulletin board: {} ballot(s)", board.len());
             for (i, b) in board.list_public_ballots().iter().enumerate() {
-                println!("  [{i}] {}", hex::encode(&b.bytes));
+                println!("  [{i}] {}", hex::encode(b.bytes()));
             }
         }
 
@@ -454,8 +468,10 @@ fn main() -> Result<()> {
                 read_json(&paths.authority(), "authority secret state")?;
             let reg: RegistrationState = read_json(&paths.registration(), "registration")?;
             let board: BulletinBoard = read_json_or_default(&paths.board())?;
-            let (tally, _internal) =
-                filter_and_tally(&pp, &authority, &reg, board.list_public_ballots())?;
+            let payloads: AuthorityBallotPayloads =
+                read_json_or_default(&paths.authority_payloads())?;
+            let full_ballots = assemble_ea_ballots(&board, &payloads)?;
+            let (tally, _internal) = filter_and_tally(&pp, &authority, &reg, &full_ballots)?;
             let statement = build_tally_statement(&pp, &board, &reg, &tally);
             write_json(&paths.tally(), &tally)?;
             write_json(&paths.statement(), &statement)?;
@@ -474,9 +490,12 @@ fn main() -> Result<()> {
                 read_json(&paths.authority(), "authority secret state")?;
             let reg: RegistrationState = read_json(&paths.registration(), "registration")?;
             let board: BulletinBoard = read_json_or_default(&paths.board())?;
+            let payloads: AuthorityBallotPayloads =
+                read_json_or_default(&paths.authority_payloads())?;
             let statement: TallyStatement =
                 read_json(&paths.statement(), "public statement (run `tally` first)")?;
-            let witness = build_tally_witness(&pp, &authority, &reg, board.list_public_ballots())?;
+            let full_ballots = assemble_ea_ballots(&board, &payloads)?;
+            let witness = build_tally_witness(&pp, &authority, &reg, &full_ballots)?;
             if !relation_check_native(&statement, &witness, &SMALL_SHAPE) {
                 bail!("native relation check failed — statement and board disagree");
             }
@@ -502,6 +521,28 @@ fn main() -> Result<()> {
             }
             let proof_v: serde_json::Value = read_json(&proof, "proof")?;
             let public_v: serde_json::Value = read_json(&public, "public inputs")?;
+
+            // The proof is only meaningful for THE statement determined by
+            // the public election data, so bind everything together:
+            // public data -> statement -> tally -> proof public inputs.
+            let pp: PublicParams = read_json(&paths.params(), "public params")?;
+            let reg: RegistrationState = read_json(&paths.registration(), "registration")?;
+            let board: BulletinBoard = read_json_or_default(&paths.board())?;
+            let statement: TallyStatement =
+                read_json(&paths.statement(), "public statement (run `tally` first)")?;
+            let tally: TallyResult = read_json(&paths.tally(), "public tally")?;
+            if !statement_matches_public_data(&statement, &pp, &board, &reg) {
+                println!("INVALID: published statement does not match the public election data");
+                std::process::exit(1);
+            }
+            if statement.tally_counts != tally.counts {
+                println!("INVALID: published tally does not match the statement");
+                std::process::exit(1);
+            }
+            if !public_inputs_match(&public_v, &statement) {
+                println!("INVALID: proof public inputs are not the current public statement");
+                std::process::exit(1);
+            }
             if backend.verify(&proof_v, &public_v)? {
                 println!("VERIFIED: the published tally is the exact FilterAndTally output");
             } else {
@@ -513,7 +554,7 @@ fn main() -> Result<()> {
         Cmd::CheckRecorded { ballot } => {
             let board: BulletinBoard = read_json_or_default(&paths.board())?;
             let b: Ballot = read_json(&ballot, "ballot")?;
-            if check_direct(&board, &b.bytes) {
+            if check_direct(&board, &b.bytes()) {
                 println!("RECORDED: exact ballot bytes are on the board");
                 println!("(keep this result private — never show the real ballot to a coercer)");
             } else {
@@ -555,6 +596,8 @@ fn main() -> Result<()> {
                 read_json(&paths.authority(), "authority secret state")?;
             let reg: RegistrationState = read_json(&paths.registration(), "registration")?;
             let board: BulletinBoard = read_json_or_default(&paths.board())?;
+            let payloads: AuthorityBallotPayloads =
+                read_json_or_default(&paths.authority_payloads())?;
             let b: Ballot = read_json(&ballot, "ballot")?;
 
             // The complainant supplies the ballot + opening (here: the
@@ -564,40 +607,62 @@ fn main() -> Result<()> {
             let pt = cr_dr::types::BallotPlaintext::from_fields(&opening.plaintext_fields)?;
 
             // Judge-private evidence from the authority side.
-            let (_, evals) = filter_and_tally(&pp, &authority, &reg, board.list_public_ballots())?;
+            let full_ballots = assemble_ea_ballots(&board, &payloads)?;
+            let (_, evals) = filter_and_tally(&pp, &authority, &reg, &full_ballots)?;
             let nonce_source = if use_threshold {
-                let shares = authority
-                    .threshold_nonce_shares
-                    .as_ref()
-                    .context("no threshold shares (run `share-nonces` first)")?
-                    .get(&pt.id)
-                    .context("no shares for this voter")?;
-                let tp = pp.threshold_params.context("no threshold params in this election")?;
-                NonceSource::ThresholdShares(shares[..tp.t].to_vec())
-            } else {
+                // The judge collects exactly t shares from t authorities.
                 let secret = authority
                     .voter_secrets
                     .get(&pt.id)
                     .context("voter unknown to the authority")?;
-                NonceSource::Direct(secret.r_ea)
+                let t = authority.threshold.t;
+                anyhow::ensure!(
+                    secret.r_ea_shares.len() >= t,
+                    "fewer than t = {t} shares stored for this voter"
+                );
+                NonceSource::ThresholdShares(secret.r_ea_shares[..t].to_vec())
+            } else {
+                // Direct mode: the logical EA performs an authorized >= t
+                // reconstruction and hands the judge the plain nonce.
+                NonceSource::Direct(
+                    authority.r_ea(pt.id).context("voter unknown to the authority")?,
+                )
             };
+            // Check the tally proof: it must verify AND be bound to the
+            // statement determined by the current public data. A missing or
+            // uncheckable proof is Unavailable — NEVER assumed valid.
             let proof_path = paths.proofs().join("proof.json");
             let public_path = paths.proofs().join("public.json");
             let backend = SnarkjsBackend::small(SnarkjsBackend::crate_root());
-            let tally_proof_valid = if proof_path.exists() && backend.toolchain_available() {
+            let tally_proof = if proof_path.exists()
+                && public_path.exists()
+                && paths.statement().exists()
+                && backend.toolchain_available()
+            {
+                let statement: TallyStatement =
+                    read_json(&paths.statement(), "public statement")?;
                 let proof: serde_json::Value = read_json(&proof_path, "proof")?;
                 let public: serde_json::Value = read_json(&public_path, "public inputs")?;
-                backend.verify(&proof, &public)?
+                if !statement_matches_public_data(&statement, &pp, &board, &reg)
+                    || !public_inputs_match(&public, &statement)
+                {
+                    println!("(tally proof is not bound to the current public statement)");
+                    TallyProofStatus::Invalid
+                } else if backend.verify(&proof, &public)? {
+                    TallyProofStatus::Verified
+                } else {
+                    TallyProofStatus::Invalid
+                }
             } else {
-                println!("(no tally proof found/verifiable; assuming it verifies)");
-                true
+                println!("(no tally proof found/verifiable; counting remains unverified)");
+                TallyProofStatus::Unavailable
             };
 
             let complaint = TalliedAsRecordedComplaint { ballot: b, opening };
             let evidence = AuthorityEvidence {
                 nonce_source,
                 prior_evaluations: &evals,
-                tally_proof_valid,
+                tally_proof,
             };
             print_judge_report(&judge_tallied_as_recorded(&pp, &reg, &board, &complaint, &evidence));
         }
@@ -615,7 +680,11 @@ fn main() -> Result<()> {
             pp.threshold_params = Some(ThresholdParams { t, k });
             write_json(&paths.params(), &pp)?;
             write_json(&paths.authority(), &authority)?;
-            println!("all authority nonces R_EA,i Shamir-shared with t={t}, k={k}");
+            println!(
+                "all authority nonces R_EA,i RE-shared with t={t}, k={k} \
+                 (nonces are threshold-shared at registration time; this rotates \
+                 the shares / changes parameters via an authorized quorum)"
+            );
             println!("(any {t} shares reconstruct; {} shares reveal nothing)", t - 1);
         }
 
@@ -675,19 +744,22 @@ fn demo() -> Result<()> {
         channel.submit(chaff_ballot(&pp, &mut rng)?);
     }
 
+    // The board gets only the public parts; the EA keeps the payloads.
     let mut bb = BulletinBoard::new();
+    let mut ea_ballots = Vec::new();
     for ballot in channel.flush_shuffled(&mut rng) {
-        bb.append(ballot);
+        bb.append(ballot.public());
+        ea_ballots.push(ballot);
     }
     println!("\nbulletin board: {} ballots (6 real + 1 fake + 3 chaff, shuffled)\n", bb.len());
 
     let (tally, _internal): (TallyResult, _) =
-        filter_and_tally(&pp, &authority, &reg, bb.list_public_ballots())?;
+        filter_and_tally(&pp, &authority, &reg, &ea_ballots)?;
     println!("public tally: candidates {:?} -> {:?} ({} counted)", pp.candidates, tally.counts, tally.counted_ballots);
     println!("  (fake + chaff rejected silently; voter 0's REAL vote counted)\n");
 
     let statement = build_tally_statement(&pp, &bb, &reg, &tally);
-    let witness = build_tally_witness(&pp, &authority, &reg, bb.list_public_ballots())?;
+    let witness = build_tally_witness(&pp, &authority, &reg, &ea_ballots)?;
     let ok = relation_check_native(&statement, &witness, &SMALL_SHAPE);
     println!("native FilterAndTally relation check: {}", if ok { "ACCEPT" } else { "REJECT" });
 

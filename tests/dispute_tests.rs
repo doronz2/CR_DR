@@ -7,6 +7,7 @@ use cr_dr::disputes::recorded_as_cast::{
 };
 use cr_dr::disputes::tallied_as_recorded::{
     judge_tallied_as_recorded, AuthorityEvidence, NonceSource, TalliedAsRecordedComplaint,
+    TallyProofStatus,
 };
 use cr_dr::protocol::bulletin_board::BulletinBoard;
 use cr_dr::protocol::fake_compliance::{build_fake_ballot, fake_compliance};
@@ -20,8 +21,8 @@ fn recorded_as_cast_succeeds_when_bytes_present() {
     let mut env = common::small_election(90);
     let ballot = cast_vote(&env.pp, &env.reg, &env.voters[0], 0, &mut env.rng).unwrap();
     let mut bb = BulletinBoard::new();
-    bb.append(ballot.clone());
-    assert!(check_direct(&bb, &ballot.bytes));
+    bb.append(ballot.public());
+    assert!(check_direct(&bb, &ballot.bytes()));
 }
 
 #[test]
@@ -29,7 +30,7 @@ fn recorded_as_cast_fails_when_absent_without_receipt() {
     let mut env = common::small_election(91);
     let ballot = cast_vote(&env.pp, &env.reg, &env.voters[0], 0, &mut env.rng).unwrap();
     let bb = BulletinBoard::new(); // ballot never posted
-    assert!(!check_direct(&bb, &ballot.bytes));
+    assert!(!check_direct(&bb, &ballot.bytes()));
     let report = adjudicate_recorded_as_cast(&env.pp, &bb, &ballot, None);
     assert_eq!(report.verdict, Verdict::Undetermined);
 }
@@ -54,17 +55,17 @@ fn judge_detects_fake_nonce_privately() {
     let t = fake_compliance(&env.pp, &coerced, 2, &mut env.rng).unwrap();
     let fake = build_fake_ballot(&env.pp, &t, &mut env.rng).unwrap();
     let mut bb = BulletinBoard::new();
-    bb.append(fake.clone());
+    bb.append(fake.public());
     let (_, evals) =
-        filter_and_tally(&env.pp, &env.authority, &env.reg, bb.list_public_ballots()).unwrap();
+        filter_and_tally(&env.pp, &env.authority, &env.reg, &[fake.clone()]).unwrap();
 
     let opening = commit_open(&fake.ciphertext, &fake.ea_payload).unwrap();
     let complaint = TalliedAsRecordedComplaint { ballot: fake, opening };
-    let r_ea = env.authority.voter_secrets[&coerced.id].r_ea;
+    let r_ea = env.authority.r_ea(coerced.id).unwrap();
     let evidence = AuthorityEvidence {
         nonce_source: NonceSource::Direct(r_ea),
         prior_evaluations: &evals,
-        tally_proof_valid: true,
+        tally_proof: TallyProofStatus::Verified,
     };
     let report = judge_tallied_as_recorded(&env.pp, &env.reg, &bb, &complaint, &evidence);
     // The judge privately identifies the fake nonce...
@@ -80,16 +81,16 @@ fn judge_accepts_valid_first_ballot_with_verifying_proof() {
     let voter = env.voters[0].clone();
     let real = cast_vote(&env.pp, &env.reg, &voter, 0, &mut env.rng).unwrap();
     let mut bb = BulletinBoard::new();
-    bb.append(real.clone());
+    bb.append(real.public());
     let (_, evals) =
-        filter_and_tally(&env.pp, &env.authority, &env.reg, bb.list_public_ballots()).unwrap();
+        filter_and_tally(&env.pp, &env.authority, &env.reg, &[real.clone()]).unwrap();
 
     let opening = commit_open(&real.ciphertext, &real.ea_payload).unwrap();
     let complaint = TalliedAsRecordedComplaint { ballot: real, opening };
     let evidence = AuthorityEvidence {
-        nonce_source: NonceSource::Direct(env.authority.voter_secrets[&voter.id].r_ea),
+        nonce_source: NonceSource::Direct(env.authority.r_ea(voter.id).unwrap()),
         prior_evaluations: &evals,
-        tally_proof_valid: true,
+        tally_proof: TallyProofStatus::Verified,
     };
     let report = judge_tallied_as_recorded(&env.pp, &env.reg, &bb, &complaint, &evidence);
     assert_eq!(report.verdict, Verdict::Undetermined); // counted under proof soundness
@@ -101,19 +102,44 @@ fn judge_blames_authority_when_tally_proof_fails() {
     let voter = env.voters[0].clone();
     let real = cast_vote(&env.pp, &env.reg, &voter, 0, &mut env.rng).unwrap();
     let mut bb = BulletinBoard::new();
-    bb.append(real.clone());
+    bb.append(real.public());
     let (_, evals) =
-        filter_and_tally(&env.pp, &env.authority, &env.reg, bb.list_public_ballots()).unwrap();
+        filter_and_tally(&env.pp, &env.authority, &env.reg, &[real.clone()]).unwrap();
 
     let opening = commit_open(&real.ciphertext, &real.ea_payload).unwrap();
     let complaint = TalliedAsRecordedComplaint { ballot: real, opening };
     let evidence = AuthorityEvidence {
-        nonce_source: NonceSource::Direct(env.authority.voter_secrets[&voter.id].r_ea),
+        nonce_source: NonceSource::Direct(env.authority.r_ea(voter.id).unwrap()),
         prior_evaluations: &evals,
-        tally_proof_valid: false,
+        tally_proof: TallyProofStatus::Invalid,
     };
     let report = judge_tallied_as_recorded(&env.pp, &env.reg, &bb, &complaint, &evidence);
     assert_eq!(report.verdict, Verdict::AuthorityFaulty);
+}
+
+#[test]
+fn judge_does_not_assume_missing_tally_proof_verifies() {
+    // A valid first ballot with NO checkable tally proof must stay
+    // Undetermined — the judge must never fail open by assuming the proof
+    // would have verified.
+    let mut env = common::small_election(98);
+    let voter = env.voters[0].clone();
+    let real = cast_vote(&env.pp, &env.reg, &voter, 0, &mut env.rng).unwrap();
+    let mut bb = BulletinBoard::new();
+    bb.append(real.public());
+    let (_, evals) =
+        filter_and_tally(&env.pp, &env.authority, &env.reg, &[real.clone()]).unwrap();
+
+    let opening = commit_open(&real.ciphertext, &real.ea_payload).unwrap();
+    let complaint = TalliedAsRecordedComplaint { ballot: real, opening };
+    let evidence = AuthorityEvidence {
+        nonce_source: NonceSource::Direct(env.authority.r_ea(voter.id).unwrap()),
+        prior_evaluations: &evals,
+        tally_proof: TallyProofStatus::Unavailable,
+    };
+    let report = judge_tallied_as_recorded(&env.pp, &env.reg, &bb, &complaint, &evidence);
+    assert_eq!(report.verdict, Verdict::Undetermined);
+    assert!(report.detail.contains("no tally proof"));
 }
 
 #[test]
@@ -123,18 +149,18 @@ fn judge_works_with_threshold_share_reconstruction() {
     let voter = env.voters[0].clone();
     let real = cast_vote(&env.pp, &env.reg, &voter, 1, &mut env.rng).unwrap();
     let mut bb = BulletinBoard::new();
-    bb.append(real.clone());
+    bb.append(real.public());
     let (_, evals) =
-        filter_and_tally(&env.pp, &env.authority, &env.reg, bb.list_public_ballots()).unwrap();
+        filter_and_tally(&env.pp, &env.authority, &env.reg, &[real.clone()]).unwrap();
 
     // Judge receives t = 3 shares (not the nonce itself, and not from the voter).
-    let shares = env.authority.threshold_nonce_shares.as_ref().unwrap()[&voter.id][0..3].to_vec();
+    let shares = env.authority.voter_secrets[&voter.id].r_ea_shares[0..3].to_vec();
     let opening = commit_open(&real.ciphertext, &real.ea_payload).unwrap();
     let complaint = TalliedAsRecordedComplaint { ballot: real, opening };
     let evidence = AuthorityEvidence {
         nonce_source: NonceSource::ThresholdShares(shares),
         prior_evaluations: &evals,
-        tally_proof_valid: true,
+        tally_proof: TallyProofStatus::Verified,
     };
     let report = judge_tallied_as_recorded(&env.pp, &env.reg, &bb, &complaint, &evidence);
     assert_eq!(report.verdict, Verdict::Undetermined); // valid + counted
@@ -147,17 +173,17 @@ fn judge_flags_duplicate_complaints_correctly() {
     let b1 = cast_vote(&env.pp, &env.reg, &voter, 0, &mut env.rng).unwrap();
     let b2 = cast_vote(&env.pp, &env.reg, &voter, 2, &mut env.rng).unwrap();
     let mut bb = BulletinBoard::new();
-    bb.append(b1);
-    bb.append(b2.clone());
+    bb.append(b1.public());
+    bb.append(b2.public());
     let (_, evals) =
-        filter_and_tally(&env.pp, &env.authority, &env.reg, bb.list_public_ballots()).unwrap();
+        filter_and_tally(&env.pp, &env.authority, &env.reg, &[b1, b2.clone()]).unwrap();
 
     let opening = commit_open(&b2.ciphertext, &b2.ea_payload).unwrap();
     let complaint = TalliedAsRecordedComplaint { ballot: b2, opening };
     let evidence = AuthorityEvidence {
-        nonce_source: NonceSource::Direct(env.authority.voter_secrets[&voter.id].r_ea),
+        nonce_source: NonceSource::Direct(env.authority.r_ea(voter.id).unwrap()),
         prior_evaluations: &evals,
-        tally_proof_valid: true,
+        tally_proof: TallyProofStatus::Verified,
     };
     let report = judge_tallied_as_recorded(&env.pp, &env.reg, &bb, &complaint, &evidence);
     assert_eq!(report.verdict, Verdict::VoterFaulty);

@@ -45,7 +45,7 @@ fn share_all_nonces_covers_every_voter() {
         let s1 = authority_share(&env.authority, id, 1).unwrap();
         let s2 = authority_share(&env.authority, id, 2).unwrap();
         let rec = reconstruct_nonce(&[s1, s2]).unwrap();
-        assert_eq!(rec, env.authority.voter_secrets[&id].r_ea);
+        assert_eq!(rec, env.authority.r_ea(id).unwrap());
     }
 }
 

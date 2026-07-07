@@ -74,6 +74,5 @@ pub fn build_fake_ballot<R: RngCore + CryptoRng>(
         sigma: transcript.sigma_fake,
     };
     let (ciphertext, opening) = commit_encrypt(&plaintext.to_fields(), rng);
-    let bytes = ciphertext.to_bytes();
-    Ok(Ballot { ciphertext, ea_payload: opening_to_payload(&opening), bytes })
+    Ok(Ballot { ciphertext, ea_payload: opening_to_payload(&opening) })
 }

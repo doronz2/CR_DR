@@ -106,6 +106,15 @@ pub struct ThresholdParams {
     pub k: usize,
 }
 
+impl ThresholdParams {
+    /// The degenerate single-authority case (t = k = 1): one authority whose
+    /// single "share" IS the nonce. Used when no threshold params are
+    /// configured, so the share-based state layout is uniform.
+    pub const fn single() -> Self {
+        ThresholdParams { t: 1, k: 1 }
+    }
+}
+
 /// Public election parameters. Everything here is public.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PublicParams {
@@ -150,30 +159,57 @@ pub struct PublicRegistrationRecord {
     pub leaf: F,
 }
 
-/// Authority-side per-voter secret (contains R_EA,i — never leaves the EA
-/// except toward the private judge / threshold shares).
+/// Authority-side per-voter record. Contains ONLY threshold material for
+/// R_EA,i — Shamir shares, one per authority. It contains neither the voter
+/// nonce R_i (which only the voter samples and holds) nor the plain R_EA,i
+/// (which exists only transiently inside the idealized preprocessing
+/// functionality and inside authorized >= t reconstructions). Any coalition
+/// of fewer than t authorities holds < t shares, which are distributed
+/// independently of R_EA,i.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthorityVoterSecret {
     pub id: VoterId,
     pub vk: VerificationKey,
-    #[serde(with = "fserde")]
-    pub r: Nonce,
-    #[serde(with = "fserde")]
-    pub r_ea: Nonce,
+    /// Shamir shares of R_EA,i; shares[j] belongs to authority j+1.
+    pub r_ea_shares: Vec<crate::crypto::shamir::Share>,
 }
 
-/// Authority secret state. Serializable only so the CLI can persist it in
-/// the authority's private directory — never publish it.
+/// The single LOGICAL election authority, implemented by k threshold
+/// authorities. Serializable only so the CLI can persist it in the
+/// authority's private directory — never publish it.
+///
+/// In a deployment each authority would hold only its own row of every
+/// share vector; this struct models their joint (authorized) interface.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AuthoritySecretState {
     /// EA decryption key (ElGamal backend).
     pub sk_ea: crate::crypto::encryption::EaSecretKey,
     /// EA receipt-signing key.
     pub receipt_sk: SecretKey,
+    /// Threshold parameters the nonce shares were generated under.
+    pub threshold: ThresholdParams,
     pub voter_secrets: HashMap<VoterId, AuthorityVoterSecret>,
-    /// Optional trusted-dealer Shamir shares of each R_EA,i.
-    pub threshold_nonce_shares:
-        Option<HashMap<VoterId, Vec<crate::crypto::shamir::Share>>>,
+}
+
+impl AuthoritySecretState {
+    /// AUTHORIZED reconstruction of R_EA,i by the logical EA — models a
+    /// >= t quorum of authorities agreeing to open the nonce (for tallying,
+    /// witness construction, or a private-judge dispute). Tier-1/Tier-2
+    /// provers call this to obtain the plain nonce; a Tier-3 threshold
+    /// prover would replace this call with an MPC evaluation over the same
+    /// shares, which is why no other code path ever stores the plain value.
+    pub fn r_ea(&self, id: VoterId) -> Result<F> {
+        let secret =
+            self.voter_secrets.get(&id).ok_or(CrDrError::UnknownVoter(id))?;
+        if secret.r_ea_shares.len() < self.threshold.t {
+            return Err(CrDrError::Threshold(format!(
+                "voter {id}: {} shares stored, need >= t = {}",
+                secret.r_ea_shares.len(),
+                self.threshold.t
+            )));
+        }
+        crate::crypto::shamir::reconstruct(&secret.r_ea_shares)
+    }
 }
 
 /// Decoded ballot plaintext.
@@ -237,20 +273,57 @@ pub fn f_to_u64(f: &F) -> Option<u64> {
     }
 }
 
-/// A ballot as it travels through the anonymous channel and onto the BB.
-///
-/// `bytes` is the exact public byte encoding of the ciphertext; the anonymous
-/// channel preserves it verbatim, so recorded-as-cast checking is exact byte
-/// matching.
+/// A ballot as cast by the voter and carried by the anonymous channel.
 ///
 /// `ea_payload` models the ciphertext body that only the EA can open. In the
-/// commitment-mode prototype backend this is a serialized opening — see the
-/// loud warning in README and `crypto::encryption`.
+/// commitment-mode prototype backend this is a serialized opening — the full
+/// plaintext, nonce and signature — so it must NEVER be published; only the
+/// EA (and, for a dispute, the private judge) may see it. See the loud
+/// warning in README and `crypto::encryption`.
+///
+/// Only the projection [`Ballot::public`] goes on the bulletin board. The
+/// exact public byte encoding is always derived from the ciphertext via
+/// [`Ballot::bytes`], never stored, so it cannot disagree with what is
+/// tallied.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ballot {
     pub ciphertext: crate::crypto::encryption::Ciphertext,
     pub ea_payload: Vec<u8>,
-    pub bytes: Vec<u8>,
+}
+
+impl Ballot {
+    /// The public part of the ballot: exactly what is posted on the board.
+    pub fn public(&self) -> PublicBallot {
+        PublicBallot { ciphertext: self.ciphertext.clone() }
+    }
+
+    /// Exact public byte encoding (derived from the ciphertext).
+    pub fn bytes(&self) -> Vec<u8> {
+        self.ciphertext.to_bytes()
+    }
+}
+
+/// The public part of a ballot: only the ciphertext. This is the ONLY
+/// per-ballot data that appears on the public bulletin board.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicBallot {
+    pub ciphertext: crate::crypto::encryption::Ciphertext,
+}
+
+impl PublicBallot {
+    /// Exact public byte encoding (derived from the ciphertext).
+    pub fn bytes(&self) -> Vec<u8> {
+        self.ciphertext.to_bytes()
+    }
+}
+
+/// EA-PRIVATE store of the ballot payloads, aligned with bulletin-board
+/// order: `payloads[i]` belongs to board entry `i`. In commitment mode a
+/// payload is the full plaintext opening — publishing it would reveal votes,
+/// voter ids, nonces and signatures.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AuthorityBallotPayloads {
+    pub payloads: Vec<Vec<u8>>,
 }
 
 /// Public tally output. This is the ONLY tally-related public output.

@@ -55,5 +55,5 @@ fn fake_and_real_ballots_have_identical_public_shape() {
     let fake = build_fake_ballot(&env.pp, &t, &mut env.rng).unwrap();
     let real = cast_vote(&env.pp, &env.reg, &voter, 0, &mut env.rng).unwrap();
     assert_eq!(fake.ciphertext.fields.len(), real.ciphertext.fields.len());
-    assert_eq!(fake.bytes.len(), real.bytes.len());
+    assert_eq!(fake.bytes().len(), real.bytes().len());
 }

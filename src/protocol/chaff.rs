@@ -31,6 +31,5 @@ pub fn chaff_ballot<R: RngCore + CryptoRng>(pp: &PublicParams, rng: &mut R) -> R
     let plaintext =
         BallotPlaintext { eid_hash: pp.eid_hash, id, vk, candidate, r, sigma };
     let (ciphertext, opening) = commit_encrypt(&plaintext.to_fields(), rng);
-    let bytes = ciphertext.to_bytes();
-    Ok(Ballot { ciphertext, ea_payload: opening_to_payload(&opening), bytes })
+    Ok(Ballot { ciphertext, ea_payload: opening_to_payload(&opening) })
 }

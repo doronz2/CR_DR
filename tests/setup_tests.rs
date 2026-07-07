@@ -12,7 +12,7 @@ fn setup_produces_consistent_public_params() {
     assert_eq!(pp.candidates, common::CANDIDATES.to_vec());
     assert_eq!(pp.duplicate_rule.id(), 1);
     assert!(authority.voter_secrets.is_empty());
-    assert!(authority.threshold_nonce_shares.is_none());
+    assert_eq!(authority.threshold, cr_dr::types::ThresholdParams::single());
 }
 
 #[test]

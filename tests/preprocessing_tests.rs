@@ -9,27 +9,89 @@ use cr_dr::protocol::preprocessing::{
 use cr_dr::protocol::setup::setup_election;
 
 #[test]
-fn voter_receives_sk_and_r_but_not_r_ea() {
+fn voter_state_cannot_carry_r_ea() {
+    // Structural: VoterState = (id, sk, vk, R_i) and nothing else. The
+    // serialized form is the exhaustive field list — no slot exists for
+    // R_EA,i or any share of it.
     let mut env = common::small_election(10);
     let (vs, _rec) = preprocess_voter(&env.pp, &mut env.authority, 7, &mut env.rng).unwrap();
-    let secret = &env.authority.voter_secrets[&7];
-    // The voter's R matches the authority record.
-    assert_eq!(vs.r, secret.r);
-    // R_EA exists on the authority side and differs from everything the
-    // voter holds. (VoterState has no r_ea field at all — the strongest
-    // guarantee is structural; here we check the values are independent.)
-    assert_ne!(secret.r_ea, vs.r);
-    assert_ne!(secret.r_ea, cr_dr::types::F::from(vs.id));
+    let json = serde_json::to_value(&vs).unwrap();
+    let mut keys: Vec<&str> =
+        json.as_object().unwrap().keys().map(|s| s.as_str()).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["id", "r", "sk", "vk"]);
+    // And the voter's R_i is independent of the authority-side nonce.
+    let r_ea = env.authority.r_ea(7).unwrap();
+    assert_ne!(r_ea, vs.r);
+}
+
+#[test]
+fn authority_state_cannot_recover_r_i() {
+    // Structural: the authority's per-voter record holds only (id, vk,
+    // R_EA-shares). Its serialized form contains no field for R_i, and the
+    // voter's actual R_i value appears nowhere in the whole serialized
+    // authority state.
+    let mut env = common::small_election(11);
+    let (vs, _rec) = preprocess_voter(&env.pp, &mut env.authority, 7, &mut env.rng).unwrap();
+    let secret_json = serde_json::to_value(&env.authority.voter_secrets[&7]).unwrap();
+    let mut keys: Vec<&str> =
+        secret_json.as_object().unwrap().keys().map(|s| s.as_str()).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["id", "r_ea_shares", "vk"]);
+    let full_state = serde_json::to_string(&env.authority).unwrap();
+    assert!(!full_state.contains(&cr_dr::types::f_to_dec(&vs.r)));
+}
+
+#[test]
+fn below_threshold_shares_cannot_reconstruct_r_ea() {
+    // With threshold params (t=3, k=5), any t-1 shares interpolate to a
+    // value unrelated to R_EA,i; only >= t (the authorized quorum) recover it.
+    let mut rng = common::rng(19);
+    let mut cfg = common::config();
+    cfg.threshold_params = Some(cr_dr::types::ThresholdParams { t: 3, k: 5 });
+    let (pp, mut authority) =
+        cr_dr::protocol::setup::setup_election(cfg, &mut rng).unwrap();
+    let (_vs, _rec) = preprocess_voter(&pp, &mut authority, 0, &mut rng).unwrap();
+
+    let shares = &authority.voter_secrets[&0].r_ea_shares;
+    assert_eq!(shares.len(), 5);
+    let authorized = authority.r_ea(0).unwrap();
+    let below_threshold =
+        cr_dr::crypto::shamir::reconstruct(&shares[0..2]).unwrap();
+    assert_ne!(below_threshold, authorized);
+    assert_eq!(
+        cr_dr::crypto::shamir::reconstruct(&shares[1..4]).unwrap(),
+        authorized
+    );
 }
 
 #[test]
 fn public_record_commitments_are_correct() {
     let mut env = common::small_election(11);
     let (vs, rec) = preprocess_voter(&env.pp, &mut env.authority, 7, &mut env.rng).unwrap();
-    let secret = &env.authority.voter_secrets[&7];
-    let h = h_com(env.pp.eid_hash, 7, &vs.vk, vs.r, secret.r_ea);
+    // The authorized quorum reconstruction yields the R_EA that h commits to.
+    let r_ea = env.authority.r_ea(7).unwrap();
+    let h = h_com(env.pp.eid_hash, 7, &vs.vk, vs.r, r_ea);
     assert_eq!(rec.h, h);
     assert_eq!(rec.leaf, h_reg(env.pp.eid_hash, 7, &vs.vk, h));
+}
+
+#[test]
+fn registration_ids_must_be_dense_for_the_indexed_table() {
+    // The table is indexed: id = leaf index, so ids must be exactly 0..N-1.
+    let mut rng = common::rng(20);
+    let (pp, mut authority) =
+        cr_dr::protocol::setup::setup_election(common::config(), &mut rng).unwrap();
+    let (_v0, rec0) = preprocess_voter(&pp, &mut authority, 0, &mut rng).unwrap();
+    let (_v2, rec2) = preprocess_voter(&pp, &mut authority, 2, &mut rng).unwrap();
+    // Gap at id 1: finalization must reject.
+    assert!(finalize_registration(&pp, &[rec0.clone(), rec2]).is_err());
+    // Dense 0..1 works.
+    let (_v1, rec1) = preprocess_voter(&pp, &mut authority, 1, &mut rng).unwrap();
+    let reg = finalize_registration(&pp, &[rec0, rec1]).unwrap();
+    assert_eq!(reg.num_voters(), 2);
+    assert_eq!(reg.leaf_index[&0], 0);
+    assert_eq!(reg.leaf_index[&1], 1);
 }
 
 #[test]
@@ -65,9 +127,10 @@ fn cut_and_choose_honest_registration_works() {
         preprocess_voter_cut_and_choose(&pp, &mut authority, 3, 8, &mut rng).unwrap();
     assert_eq!(transcript.q, 8);
     assert_eq!(transcript.opened.len(), 7);
-    // Final pair is consistent with the published record.
-    let secret = &authority.voter_secrets[&3];
-    assert_eq!(rec.h, h_com(pp.eid_hash, 3, &vs.vk, vs.r, secret.r_ea));
+    // Final pair is consistent with the published record (authorized
+    // quorum reconstruction of the threshold-shared R_EA).
+    let r_ea = authority.r_ea(3).unwrap();
+    assert_eq!(rec.h, h_com(pp.eid_hash, 3, &vs.vk, vs.r, r_ea));
 }
 
 #[test]

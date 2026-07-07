@@ -10,8 +10,7 @@ use cr_dr::types::{Ballot, BallotPlaintext, F, InternalBallotStatus, VoterState}
 
 fn ballot_from_plaintext(pt: &BallotPlaintext, rng: &mut rand_chacha::ChaCha20Rng) -> Ballot {
     let (ciphertext, opening) = commit_encrypt(&pt.to_fields(), rng);
-    let bytes = ciphertext.to_bytes();
-    Ballot { ciphertext, ea_payload: opening_to_payload(&opening), bytes }
+    Ballot { ciphertext, ea_payload: opening_to_payload(&opening) }
 }
 
 fn signed_plaintext(

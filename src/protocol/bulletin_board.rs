@@ -1,15 +1,20 @@
 //! Append-only public bulletin board and the (modeled) anonymous channel.
 //!
+//! The board holds ONLY the public part of each ballot (the ciphertext);
+//! serializing the whole board is safe to publish. The EA-only payloads
+//! travel separately (see `types::AuthorityBallotPayloads`).
+//!
 //! The anonymous channel hides sender identity in the model and preserves
-//! exact ballot bytes, so recorded-as-cast checking is exact byte matching.
+//! exact ballot bytes, so recorded-as-cast checking is exact byte matching
+//! (bytes are derived from the posted ciphertexts, never stored).
 
 use rand::{CryptoRng, Rng, RngCore};
 
-use crate::types::Ballot;
+use crate::types::{Ballot, PublicBallot};
 
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct BulletinBoard {
-    entries: Vec<Ballot>,
+    entries: Vec<PublicBallot>,
 }
 
 impl BulletinBoard {
@@ -17,18 +22,18 @@ impl BulletinBoard {
         Self::default()
     }
 
-    pub fn append(&mut self, ballot: Ballot) {
+    pub fn append(&mut self, ballot: PublicBallot) {
         self.entries.push(ballot);
     }
 
     /// Public, ordered list of posted ballots.
-    pub fn list_public_ballots(&self) -> &[Ballot] {
+    pub fn list_public_ballots(&self) -> &[PublicBallot] {
         &self.entries
     }
 
     /// Exact-byte membership test over the public ballot bytes.
     pub fn contains_exact_bytes(&self, ballot_bytes: &[u8]) -> bool {
-        self.entries.iter().any(|b| b.bytes == ballot_bytes)
+        self.entries.iter().any(|b| b.bytes() == ballot_bytes)
     }
 
     pub fn len(&self) -> usize {

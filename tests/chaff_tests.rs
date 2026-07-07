@@ -29,7 +29,7 @@ fn chaff_has_the_same_public_shape_and_rejection_class_as_fake_ballots() {
 
     // Same public object shape.
     assert_eq!(chaff.ciphertext.fields.len(), fake.ciphertext.fields.len());
-    assert_eq!(chaff.bytes.len(), fake.bytes.len());
+    assert_eq!(chaff.bytes().len(), fake.bytes().len());
 
     // Same internal rejection class (InvalidRegistration for both), so even
     // the tallier's internal log does not separate chaff from fake ballots.

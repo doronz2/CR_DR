@@ -67,7 +67,7 @@ pub fn adjudicate_recorded_as_cast(
     ballot: &Ballot,
     receipt: Option<&SubmissionReceipt>,
 ) -> JudgeReport {
-    if bb.contains_exact_bytes(&ballot.bytes) {
+    if bb.contains_exact_bytes(&ballot.bytes()) {
         return JudgeReport::new(
             Verdict::VoterFaulty,
             "ballot bytes are present on the board; complaint unfounded",

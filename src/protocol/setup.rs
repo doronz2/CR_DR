@@ -58,8 +58,8 @@ pub fn setup_election<R: RngCore + CryptoRng>(
     let authority = AuthoritySecretState {
         sk_ea,
         receipt_sk,
+        threshold: pp.threshold_params.unwrap_or(crate::types::ThresholdParams::single()),
         voter_secrets: HashMap::new(),
-        threshold_nonce_shares: None,
     };
     Ok((pp, authority))
 }

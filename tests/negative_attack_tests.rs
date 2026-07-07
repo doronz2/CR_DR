@@ -12,6 +12,7 @@ use cr_dr::crypto::hash::h_com;
 use cr_dr::disputes::judge::Verdict;
 use cr_dr::disputes::tallied_as_recorded::{
     judge_tallied_as_recorded, AuthorityEvidence, NonceSource, TalliedAsRecordedComplaint,
+    TallyProofStatus,
 };
 use cr_dr::protocol::bulletin_board::BulletinBoard;
 use cr_dr::protocol::fake_compliance::{build_fake_ballot, fake_compliance};
@@ -107,7 +108,7 @@ fn giving_r_ea_to_the_coercer_breaks_fake_compliance() {
     let mut env = common::small_election(112);
     let coerced = env.voters[0].clone();
     let t = fake_compliance(&env.pp, &coerced, 2, &mut env.rng).unwrap();
-    let r_ea = env.authority.voter_secrets[&coerced.id].r_ea; // leaked!
+    let r_ea = env.authority.r_ea(coerced.id).unwrap(); // leaked!
     let record = env.reg.record(coerced.id).unwrap();
 
     // Coercer's test on the surrendered (fake) nonce: FAILS -> fake detected.
@@ -136,11 +137,12 @@ fn public_detailed_verdicts_leak_evasion_status() {
     let fake = build_fake_ballot(&env.pp, &t, &mut env.rng).unwrap();
     let real = cast_vote(&env.pp, &env.reg, &coerced, 0, &mut env.rng).unwrap();
     let mut bb = BulletinBoard::new();
-    bb.append(fake.clone());
-    bb.append(real.clone());
+    bb.append(fake.public());
+    bb.append(real.public());
     let (_, evals) =
-        filter_and_tally(&env.pp, &env.authority, &env.reg, bb.list_public_ballots()).unwrap();
-    let r_ea = env.authority.voter_secrets[&coerced.id].r_ea;
+        filter_and_tally(&env.pp, &env.authority, &env.reg, &[fake.clone(), real.clone()])
+            .unwrap();
+    let r_ea = env.authority.r_ea(coerced.id).unwrap();
 
     let judge = |ballot: &cr_dr::types::Ballot| {
         let opening = commit_open(&ballot.ciphertext, &ballot.ea_payload).unwrap();
@@ -148,7 +150,7 @@ fn public_detailed_verdicts_leak_evasion_status() {
         let evidence = AuthorityEvidence {
             nonce_source: NonceSource::Direct(r_ea),
             prior_evaluations: &evals,
-            tally_proof_valid: true,
+            tally_proof: TallyProofStatus::Verified,
         };
         judge_tallied_as_recorded(&env.pp, &env.reg, &bb, &complaint, &evidence)
     };

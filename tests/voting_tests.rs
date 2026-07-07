@@ -46,6 +46,6 @@ fn several_voters_tally_correctly() {
 fn ballot_bytes_are_the_exact_public_ciphertext_encoding() {
     let mut env = common::small_election(24);
     let ballot = cast_vote(&env.pp, &env.reg, &env.voters[0], 1, &mut env.rng).unwrap();
-    assert_eq!(ballot.bytes, ballot.ciphertext.to_bytes());
-    assert_eq!(ballot.bytes.len(), 32); // one field element in commitment mode
+    assert_eq!(ballot.bytes(), ballot.ciphertext.to_bytes());
+    assert_eq!(ballot.bytes().len(), 32); // one field element in commitment mode
 }
