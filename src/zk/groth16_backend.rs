@@ -133,6 +133,77 @@ impl SnarkjsBackend {
     }
 }
 
+/// Groth16 proving via the rapidsnark NATIVE prover (C++, assembly field
+/// arithmetic) — a drop-in replacement for the snarkjs `groth16 prove` step
+/// only. It consumes the SAME artifacts (.zkey + .wtns produced by the wasm
+/// witness calculator) and its proofs verify under the SAME verification
+/// keys, so witness generation and verification stay on `SnarkjsBackend`.
+/// Build it with scripts/install_rapidsnark.sh; the binary is discovered at
+/// $RAPIDSNARK_PROVER or build/rapidsnark-src/package_macos_arm64/bin/prover
+/// (and the linux equivalents).
+#[derive(Debug, Clone)]
+pub struct RapidsnarkBackend {
+    /// The snarkjs backend supplying witness generation and verification.
+    pub inner: SnarkjsBackend,
+    /// Path to the rapidsnark `prover` binary.
+    pub prover_bin: PathBuf,
+}
+
+impl RapidsnarkBackend {
+    /// Locate the rapidsnark prover for `inner`'s repo root. Checks
+    /// $RAPIDSNARK_PROVER, then the standard package locations produced by
+    /// scripts/install_rapidsnark.sh.
+    pub fn discover(inner: SnarkjsBackend) -> Option<Self> {
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        if let Some(p) = std::env::var_os("RAPIDSNARK_PROVER") {
+            candidates.push(PathBuf::from(p));
+        }
+        for pkg in [
+            "build/rapidsnark-src/package_macos_arm64/bin/prover",
+            "build/rapidsnark-src/package_macos_x86_64/bin/prover",
+            "build/rapidsnark-src/package/bin/prover",
+        ] {
+            candidates.push(inner.root.join(pkg));
+        }
+        let prover_bin = candidates.into_iter().find(|p| p.exists())?;
+        Some(RapidsnarkBackend { inner, prover_bin })
+    }
+
+    /// True iff both the rapidsnark binary and the circuit artifacts exist.
+    pub fn toolchain_available(&self) -> bool {
+        self.prover_bin.exists() && self.inner.toolchain_available()
+    }
+
+    /// Full Groth16 prove: wasm witness generation (shared with snarkjs),
+    /// then the native rapidsnark prover. Returns (proof.json, public.json).
+    pub fn prove(&self, input: &Value) -> Result<(Value, Value)> {
+        let work = tempdir()?;
+        let wtns = self.inner.generate_witness(input, &work)?;
+        let (proof, public) = self.prove_witness(&wtns, &work)?;
+        std::fs::remove_dir_all(&work).ok();
+        Ok((proof, public))
+    }
+
+    /// Prove from an existing witness file (no witness generation).
+    pub fn prove_witness(&self, wtns: &Path, work: &Path) -> Result<(Value, Value)> {
+        let proof_path = work.join("proof.json");
+        let public_path = work.join("public.json");
+        run(Command::new(&self.prover_bin)
+            .arg(self.inner.zkey())
+            .arg(wtns)
+            .arg(&proof_path)
+            .arg(&public_path))?;
+        let proof: Value = serde_json::from_slice(&std::fs::read(&proof_path)?)?;
+        let public: Value = serde_json::from_slice(&std::fs::read(&public_path)?)?;
+        Ok((proof, public))
+    }
+
+    /// Verification is unchanged: same verification key, same checker.
+    pub fn verify(&self, proof: &Value, public: &Value) -> Result<bool> {
+        self.inner.verify(proof, public)
+    }
+}
+
 fn node() -> String {
     "node".to_string()
 }

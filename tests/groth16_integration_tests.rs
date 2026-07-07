@@ -33,24 +33,27 @@ fn backend() -> Option<SnarkjsBackend> {
 
 fn build_valid_input(seed: u64) -> (serde_json::Value, cr_dr::zk::statement::TallyStatement) {
     let mut env = common::small_election(seed);
-    let mut bb = BulletinBoard::new();
+    let mut ballots = Vec::new();
     // fake before real for voter 0 + honest voters + chaff
     let coerced = env.voters[0].clone();
     let t = fake_compliance(&env.pp, &coerced, 2, &mut env.rng).unwrap();
-    bb.append(build_fake_ballot(&env.pp, &t, &mut env.rng).unwrap());
-    bb.append(cast_vote(&env.pp, &env.reg, &coerced, 0, &mut env.rng).unwrap());
+    ballots.push(build_fake_ballot(&env.pp, &t, &mut env.rng).unwrap());
+    ballots.push(cast_vote(&env.pp, &env.reg, &coerced, 0, &mut env.rng).unwrap());
     let v1 = env.voters[1].clone();
     let v2 = env.voters[2].clone();
-    bb.append(cast_vote(&env.pp, &env.reg, &v1, 1, &mut env.rng).unwrap());
-    bb.append(cast_vote(&env.pp, &env.reg, &v2, 1, &mut env.rng).unwrap());
-    bb.append(chaff_ballot(&env.pp, &mut env.rng).unwrap());
+    ballots.push(cast_vote(&env.pp, &env.reg, &v1, 1, &mut env.rng).unwrap());
+    ballots.push(cast_vote(&env.pp, &env.reg, &v2, 1, &mut env.rng).unwrap());
+    ballots.push(chaff_ballot(&env.pp, &mut env.rng).unwrap());
+    let mut bb = BulletinBoard::new();
+    for b in &ballots {
+        bb.append(b.public());
+    }
 
-    let (tally, _) =
-        filter_and_tally(&env.pp, &env.authority, &env.reg, bb.list_public_ballots()).unwrap();
+    let (tally, _) = filter_and_tally(&env.pp, &env.authority, &env.reg, &ballots).unwrap();
     assert_eq!(tally.counts, vec![1, 2, 0]); // real vote for 0 counted, fake for 2 rejected
     let statement = build_tally_statement(&env.pp, &bb, &env.reg, &tally);
     let witness =
-        build_tally_witness(&env.pp, &env.authority, &env.reg, bb.list_public_ballots()).unwrap();
+        build_tally_witness(&env.pp, &env.authority, &env.reg, &ballots).unwrap();
     assert!(relation_check_native(&statement, &witness, &SMALL_SHAPE));
     (generate_witness_input(&statement, &witness, &SMALL_SHAPE).unwrap(), statement)
 }
@@ -61,6 +64,22 @@ fn groth16_proves_and_verifies_valid_instance() {
     let (input, _) = build_valid_input(80);
     let (proof, public) = b.prove(&input).expect("proving must succeed");
     assert!(b.verify(&proof, &public).unwrap(), "valid proof must verify");
+}
+
+#[test]
+fn snarkjs_public_inputs_are_exactly_the_statement() {
+    // The native statement -> public.json mapping must match what snarkjs
+    // emits, in order — Verify/DisputeTally rely on this exact binding.
+    use cr_dr::zk::circom_io::{public_inputs_match, statement_public_inputs};
+    let Some(b) = backend() else { return };
+    let (input, statement) = build_valid_input(86);
+    let (_proof, public) = b.prove(&input).unwrap();
+    let expected: Vec<serde_json::Value> = statement_public_inputs(&statement)
+        .into_iter()
+        .map(serde_json::Value::String)
+        .collect();
+    assert_eq!(public.as_array().unwrap(), &expected);
+    assert!(public_inputs_match(&public, &statement));
 }
 
 #[test]
@@ -140,4 +159,38 @@ fn proof_object_contains_no_witness_data() {
     for v in &public_strs {
         assert!(allowed.contains(v), "public input {v} is not a statement value");
     }
+}
+
+// ---------------------------------------------------------------------------
+// rapidsnark native prover (optional fast path)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn rapidsnark_proves_and_snarkjs_verifies() {
+    use cr_dr::zk::groth16_backend::RapidsnarkBackend;
+    let Some(snark) = backend() else { return };
+    let Some(rapid) = RapidsnarkBackend::discover(snark.clone()) else {
+        eprintln!("SKIP: rapidsnark prover not found (run scripts/install_rapidsnark.sh)");
+        return;
+    };
+    let (input, statement) = build_valid_input(87);
+
+    // Native prover, same .zkey — proof must verify under the SAME
+    // verification key and bind the SAME public inputs.
+    let (proof, public) = rapid.prove(&input).expect("rapidsnark proving must succeed");
+    assert!(rapid.verify(&proof, &public).unwrap(), "rapidsnark proof must verify");
+    assert!(cr_dr::zk::circom_io::public_inputs_match(&public, &statement));
+
+    // Cross-check against the snarkjs prover on the same input.
+    let (_sp, s_public) = snark.prove(&input).unwrap();
+    assert_eq!(
+        public.as_array().unwrap(),
+        s_public.as_array().unwrap(),
+        "both provers must bind identical public inputs"
+    );
+
+    // Tampered public input still rejected.
+    let mut bad = public.clone();
+    bad.as_array_mut().unwrap()[0] = serde_json::Value::String("999".into());
+    assert!(!rapid.verify(&proof, &bad).unwrap());
 }
