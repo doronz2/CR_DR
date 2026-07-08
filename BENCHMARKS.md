@@ -176,9 +176,17 @@ figures cited for the optional O(log n) aggregate):
 | | N = 10^4 | N = 10^5 | N = 10^6 |
 |---|---|---|---|
 | chunks K / proofs 2K+1 | 160 / 321 | 1,600 / 3,201 | 16,000 / 32,001 |
-| prove, 1 machine sequential | ~18 min | ~3.1 h | ~31 h |
-| prove, 64 workers | ~20 s | ~3 min | ~29 min |
-| verify all proofs (in-process, ~3 ms each) | ~1 s | ~10 s | ~96 s |
+| prove, this M3 Max (jobs=2) | **10.8 min MEASURED** | ~1.8 h (proj.) | ~18 h (proj.) |
+| prove, 90-vCPU cloud box (jobs~15) | ~1.5-2 min (proj.) | ~15-20 min (proj.) | ~2.5-3 h (proj.) |
+| verify all proofs | **67.5 s MEASURED** (per-proof CLI) | ~11 min CLI / ~10 s in-process | ~96 s in-process |
+
+The N = 10^4 row is now MEASURED end-to-end on the laptop via
+`cargo run --release --bin prove_chunked -- --ballots 20480` (24-bit board
+positions; 645.8 s prove wall at 2 concurrent rapidsnark jobs = 4.04 s
+per chunk-pair amortized; instance generation + witness/commitments add
+~70 s). GCP_RUNBOOK.md gives the one-command cloud recipe for the faster
+run; the 10^5/10^6 columns remain projections from the same measured
+per-chunk cost.
 
 ## Reading the numbers
 

@@ -58,7 +58,7 @@ pub fn batcher_schedule(n: usize) -> Vec<(usize, usize)> {
 
 /// One private record as the circuit sees it (all values already
 /// range-bounded by the relation: valid is 0/1, id < 2^8, pos < 2^8 in the
-/// monolithic circuit; pos < 2^16 in the chunked pipeline).
+/// monolithic circuit; pos < 2^24 in the chunked pipeline).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rec {
     pub valid: bool,
@@ -74,10 +74,10 @@ impl Rec {
         ((!self.valid as u64) << 16) | (self.id << 8) | self.pos
     }
 
-    /// key = (1-valid)*2^24 + id*2^16 + pos, the CHUNKED pipeline's wider
-    /// packing (global 16-bit positions, 9-bit ids incl. the sentinel).
+    /// key = (1-valid)*2^33 + id*2^24 + pos, the CHUNKED pipeline's wider
+    /// packing (global 24-bit positions, 9-bit ids incl. the sentinel).
     pub fn key_wide(&self) -> u64 {
-        ((!self.valid as u64) << 24) | (self.id << 16) | self.pos
+        ((!self.valid as u64) << 33) | (self.id << 24) | self.pos
     }
 
     /// The cross-run sentinel predecessor record: id = 256 collides with

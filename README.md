@@ -321,14 +321,32 @@ node/snarkjs startup, not the pairing check). These are Tier-1 numbers: one
 logical prover with the full witness. No decentralized proving is
 benchmarked.
 
-### Scaling beyond one circuit
+### Scaling beyond one circuit: the chunked pipeline
 
 The monolithic circuit is practical to ~10^3 voters on a laptop and capped
 near ~10^4 by memory and the largest public powers-of-tau (2^28). The
-design sketch for chunked proving — fixed-size validity chunks + sorted-run
-chunks with a Fiat-Shamir grand-product permutation argument and hiding
-boundary/partial-tally commitments — is in **CHUNKED_TALLY_DESIGN.md**
-(review-stage, not implemented).
+CHUNKED pipeline (design: **CHUNKED_TALLY_DESIGN.md**; implemented) proves
+the same relation as K fixed-size chunk proofs plus public aggregation
+checks: K `ValidityChunk` proofs (the monolithic per-slot stage verbatim +
+board-chain segment + blinded record commitment), K `SortedRunChunk`
+proofs (sortedness across hiding boundary commitments, first-valid
+counting, committed partial tallies, grand products under a Fiat-Shamir
+challenge derived AFTER both record AND sorted-run commitments), and one
+`TallySum` proof opening only the total. 24-bit board positions support up
+to 2^24 slots with the same fixed circuits (one ceremony each, independent
+of N).
+
+Run it end-to-end on one machine with the parallel driver:
+
+```bash
+cargo run --release --bin prove_chunked -- --ballots 20480   # N=10^4 row
+```
+
+which proves all 2K+1 chunk proofs with `cores/6` concurrent rapidsnark
+jobs and verifies the aggregate. Measured laptop numbers and the composed
+cost projection are in **BENCHMARKS.md**; **GCP_RUNBOOK.md** has a
+one-command cloud recipe (c3d-highcpu-90 spot) for the measured N = 10^4
+run.
 
 ## 7. Threshold authority
 
@@ -400,6 +418,7 @@ receipt in a coercer's hands; it needs a separate treatment.
 | `src/lib.rs` | Crate root: module tree and re-exports; scope statement (construction only, no CR game). |
 | `src/main.rs` | The **`cr_dr` CLI**. One subcommand per protocol procedure (`setup`, `register-voter`, `finalize-registration`, `vote`, `fake-compliance`, `build-fake-ballot`, `chaff`, `submit`, `flush-channel`, `show-board`, `tally`, `prove`, `verify`, `check-recorded`, `issue-receipt`, `dispute-recorded`, `dispute-tally`, `share-nonces`, `demo`). Defines the election-directory layout and enforces the trust split (`public/` vs `authority/` vs `voters/<id>.json`): `public/board.json` holds ciphertexts only, the EA payloads (openings) go to `authority/ballot_payloads.json`, and `verify`/`dispute-tally` bind the proof's public inputs to the statement recomputed from public data. |
 | `src/bin/gen_example_inputs.rs` | Deterministically regenerates the checked-in circuit inputs in `circuits/input_examples/` (a valid mixed board, and the fake-before-real scenario), asserting they satisfy the native relation. |
+| `src/bin/prove_chunked.rs` | Parallel single-machine driver for the chunked pipeline: builds a synthetic election at a target board size, proves all 2K+1 chunk proofs with `cores/6` concurrent rapidsnark jobs, verifies the aggregate (proofs + public-input bindings). |
 | `src/types.rs` | All core protocol types: `F` (BN254 scalar), `PublicParams`, `ElectionConfig`, `DuplicateRule` (+ its statement id), `ThresholdParams`, `VoterState` (sk_i, vk_i, R_i — **cannot** carry R_EA,i), `PublicRegistrationRecord` (h_i, leaf_i), `AuthorityVoterSecret` / `AuthoritySecretState` (where R_EA,i lives), `BallotPlaintext` with the canonical **9-field encoding** `[eid_hash, id, vk.x, vk.y, candidate, R, sig.Rx, sig.Ry, sig.S]` (`to_fields`/`from_fields`), `Ballot` (ciphertext + EA-only payload; `.public()` projects the board-safe part, `.bytes()` derives the exact public encoding — never stored), `PublicBallot` (ciphertext only — the ONLY per-ballot data on the public board), `AuthorityBallotPayloads` (EA-private payload store aligned with board order), `TallyResult` (the only public tally output), `InternalBallotStatus`/`InternalBallotEvaluation` (test/debug only, deliberately non-serializable). Also the field⇄decimal-string serde helpers (`f_to_dec`, `f_from_dec`, `fserde`). |
 | `src/errors.rs` | `CrDrError` (thiserror): config, duplicate-voter, crypto, Merkle, threshold, cut-and-choose audit, ZK-toolchain errors. |
 
@@ -442,6 +461,7 @@ receipt in a coercer's hands; it needs a separate treatment.
 | `statement.rs` | `TallyStatement` — the public inputs and nothing else (eid_hash, MR, candidate-set commitment, bb_commitment, counts, sizes, rule id, pk_ea commitment); `build_tally_statement` from public data only; `statement_matches_public_data` — the native check verifiers must run alongside the proof (binds `num_voters`/`pk_ea_commitment`, which the circuit cannot constrain). |
 | `witness.rs` | `TallyWitness`/`BallotWitnessRow` (per-ballot private inputs: ct, 9 plaintext fields, rho, R_EA, indexed row values reg_vk/reg_h, sibling path at index id — direction bits are id's own bits, not witness). Documents the **prover tiers** (Tier 1 single prover implemented; Tier 3 replaces the share-based `r_ea()` call with MPC). `build_tally_witness` mirrors FilterAndTally and applies the **dummy-substitution policy** for hard-constraint-unsafe ballots. `padding_row`/`padded_rows` fill circuit slots beyond `num_ballots`. |
 | `mock_backend.rs` | `relation_check_native` — the native mirror of the circuit, constraint-for-constraint: soft flags, deterministic strict-bits in-range flag, HARD gated indexed-row/root check (unsatisfiable ⇒ false), `batcher_schedule` (THE sorting-network schedule, shared with the circom side), sorted-record counting, BB chain, tally equality. Includes `circuit_sig_ok` with **bit-exact integer scalar multiplication** (`mul_bits`) matching circomlib semantics. |
+| `chunked.rs` | The CHUNKED pipeline: `build_chunked_tally` (records via the shared `eval_row`, global sort, blinded rc/sc commitments, Fiat-Shamir challenges, boundary chain, partial tallies, grand products), `chunked_relation_check_native` (every chunk-circuit constraint + every aggregator check), circom input serialization and expected public-input vectors per proof. |
 | `circom_io.rs` | `generate_witness_input` — serializes (statement, witness) into the circuit's `input.json` (decimal strings, signal names matching the main component); `statement_public_inputs`/`public_inputs_match` — the exact snarkjs `public.json` a proof of a statement must carry (verifiers reject proofs bound to any other statement). |
 | `groth16_backend.rs` | `SnarkjsBackend` — Groth16 via the snarkjs CLI: artifact discovery (`toolchain_available`), `generate_witness` (wasm), `prove` → (proof.json, public.json), `verify`. Race-free per-call work directories. `RapidsnarkBackend` — optional NATIVE prover (iden3 rapidsnark, C++): same .zkey/.wtns, ~12–14× faster prove step, proofs verify under the same snarkjs verification keys (`discover` via $RAPIDSNARK_PROVER or the build tree). |
 

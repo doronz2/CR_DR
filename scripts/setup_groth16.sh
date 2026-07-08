@@ -28,6 +28,16 @@ POWER=$((POWER + 1))   # headroom for witness/public wires
 echo "constraints: $CONSTRAINTS -> using power 2^$POWER"
 
 PTAU_FINAL="$PTAU_DIR/pot${POWER}_final.ptau"
+# A larger existing ptau works for any smaller circuit: reuse it.
+if [ ! -f "$PTAU_FINAL" ]; then
+  for BIGGER in $(seq $((POWER + 1)) 28); do
+    if [ -f "$PTAU_DIR/pot${BIGGER}_final.ptau" ]; then
+      PTAU_FINAL="$PTAU_DIR/pot${BIGGER}_final.ptau"
+      echo "reusing existing pot${BIGGER}_final.ptau"
+      break
+    fi
+  done
+fi
 if [ ! -f "$PTAU_FINAL" ]; then
   echo "Generating dev powers-of-tau 2^$POWER (single local contribution)..."
   $SNARKJS powersoftau new bn128 "$POWER" "$PTAU_DIR/pot${POWER}_0000.ptau" -v

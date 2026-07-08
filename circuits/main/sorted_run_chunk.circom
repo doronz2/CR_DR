@@ -19,9 +19,9 @@ pragma circom 2.0.0;
 //   * partial tallies leave the chunk ONLY as a hiding commitment tc
 //     (opened jointly by tally_sum_chunk.circom, revealing only totals).
 //
-// Sort key (ascending) = (1-valid)*2^24 + id*2^16 + pos, faithful because
+// Sort key (ascending) = (1-valid)*2^33 + id*2^24 + pos, faithful because
 // valid is boolean, id < 2^9 (sentinel 256; real ids < 2^8) and
-// pos < 2^16 — all range-checked here, so comparators are sound
+// pos < 2^24 — all range-checked here, so comparators are sound
 // independently of the permutation argument.
 //
 // Public products pp/qq are both blinded by the same nonzero rho_blind,
@@ -101,9 +101,9 @@ template SortedRunChunk(C, nC) {
         validBit[j].in <== v[0];
         idBits[j] = Num2Bits(9);       // sentinel id = 256 needs 9 bits
         idBits[j].in <== v[1];
-        posBits[j] = Num2Bits(16);
+        posBits[j] = Num2Bits(24);
         posBits[j].in <== v[2];
-        rawKey[j] <== (1 - v[0]) * 16777216 + v[1] * 65536 + v[2];
+        rawKey[j] <== (1 - v[0]) * 8589934592 + v[1] * 16777216 + v[2];
     }
 
     // The run-0 sentinel predecessor (id = 256) must not constrain
@@ -123,7 +123,7 @@ template SortedRunChunk(C, nC) {
     // -------- sortedness: key[j] <= key[j+1] (boundary included)
     component le[C];
     for (var j = 0; j < C; j++) {
-        le[j] = LessEqThan(25);
+        le[j] = LessEqThan(34);
         le[j].in[0] <== key[j];
         le[j].in[1] <== key[j + 1];
         le[j].out === 1;

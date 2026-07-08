@@ -22,10 +22,10 @@ anyhow = "1"
 hex = "0.4"
 num-bigint = "0.4"
 clap = { version = "4", features = ["derive"] }
+tempfile = "=3.10.1"
 
 [dev-dependencies]
 proptest = "1.4"
-tempfile = "=3.10.1"
 criterion = "0.5"
 
 [[bin]]
@@ -35,6 +35,10 @@ path = "src/main.rs"
 [[bin]]
 name = "gen_example_inputs"
 path = "src/bin/gen_example_inputs.rs"
+
+[[bin]]
+name = "prove_chunked"
+path = "src/bin/prove_chunked.rs"
 
 [[bench]]
 name = "prover"

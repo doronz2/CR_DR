@@ -138,8 +138,8 @@ pub fn build_chunked_tally<R: RngCore + CryptoRng>(
     let c = chunk_size;
     let k_chunks = ballots.len().div_ceil(c).max(1);
     let padded = k_chunks * c;
-    if ballots.len() > 1 << 16 {
-        return Err(CrDrError::ZkToolchain("board exceeds 2^16 slots".into()));
+    if ballots.len() > 1 << 24 {
+        return Err(CrDrError::ZkToolchain("board exceeds 2^24 slots".into()));
     }
 
     let (tally, _) =
@@ -297,7 +297,7 @@ pub fn chunked_relation_check_native(ct: &ChunkedTally) -> bool {
     if ct.merkle_depth < 8 && st.num_voters > (1u64 << ct.merkle_depth) {
         return false;
     }
-    if st.num_ballots as usize > k_chunks * c || st.num_ballots >= 1 << 16 {
+    if st.num_ballots as usize > k_chunks * c || st.num_ballots >= 1 << 24 {
         return false;
     }
     let cand_f: Vec<F> = ct.candidates.iter().map(|x| F::from(*x)).collect();
@@ -375,7 +375,7 @@ pub fn chunked_relation_check_native(ct: &ChunkedTally) -> bool {
         let sentinel_in = bnd_in.id == 256;
         let mut prev_key = if sentinel_in { 0 } else { bnd_in.key_wide() };
         for r in run {
-            if r.id >= 512 || r.pos >= (1 << 16) {
+            if r.id >= 512 || r.pos >= (1 << 24) {
                 return false;
             }
             if prev_key > r.key_wide() {
