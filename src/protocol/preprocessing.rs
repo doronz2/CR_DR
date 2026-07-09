@@ -102,6 +102,18 @@ pub fn preprocess_voter<R: RngCore + CryptoRng>(
     // Voter side: the voter samples and keeps (sk, vk, R_i).
     let voter = voter_registration_secrets(rng);
 
+    // Registration-time vk validation: the public table must contain only
+    // valid non-identity subgroup points. This is a PUBLIC property —
+    // auditors can recheck it on the published Reg table — and it is what
+    // lets the circuit's soft on-curve signature check agree with the
+    // native verifier's subgroup decode for every ballot whose vk matches
+    // its registration row.
+    if !crate::crypto::signature::vk_is_well_formed(&voter.vk) {
+        return Err(CrDrError::Crypto(
+            "registration rejected: vk is not a valid non-identity subgroup point".into(),
+        ));
+    }
+
     // Authority side, inside F_prep: threshold-generate R_EA,i.
     let tp = nonce_threshold(pp);
     let r_ea: Nonce = F::rand(rng);

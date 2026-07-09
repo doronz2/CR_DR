@@ -16,14 +16,19 @@ pragma circom 2.0.0;
 //     BabyDbl are complete on BabyJubJub for all curve points, including
 //     the identity and small-order torsion — circomlib's Montgomery-ladder
 //     EscalarMulAny is NOT safe for torsion inputs);
-//   - S < 2^251           -> strict decomposition + soft top-zero flag
-//     (the low 251 bits feed the fixed-base ladder, which is always safe).
-// ok = pointEq AND onCurveA AND onCurveR AND sTopZero. For well-formed
+//   - S canonical (S < l, the prime subgroup order) -> strict
+//     decomposition + SOFT CompConstant flag. This must match the native
+//     verifier's canonicity rule exactly: without it, a voter could
+//     malleate her own valid signature to S+l (same curve equation, since
+//     (S+l)*Base8 = S*Base8) and make the circuit's validity bit disagree
+//     with the native tally — an UNSAT tally proof, i.e. a DoS.
+// ok = pointEq AND onCurveA AND onCurveR AND sCanonical. For well-formed
 // inputs the muxed values are the real ones, so acceptance is unchanged.
 
 include "circomlib/circuits/poseidon.circom";
 include "circomlib/circuits/bitify.circom";
 include "circomlib/circuits/comparators.circom";
+include "circomlib/circuits/compconstant.circom";
 include "circomlib/circuits/babyjub.circom";
 include "circomlib/circuits/escalarmulfix.circom";
 
@@ -147,15 +152,20 @@ template SchnorrVerify() {
     rhs.x2 <== mulA.outx;
     rhs.y2 <== mulA.outy;
 
-    // ---- S: strict decomposition, soft top-zero flag, low 251 bits used
+    // ---- S: strict decomposition, SOFT canonicity flag (S < l where
+    //      l = the BabyJubJub prime subgroup order; CompConstant(l-1)
+    //      outputs 1 iff S > l-1). Canonical S < l < 2^251, so the low
+    //      251 bits fed to the fixed-base ladder are S itself whenever
+    //      the flag is 1; when the flag is 0 the ladder output is unused
+    //      garbage and ok = 0 (soft, never unsat).
     component sBits = Num2Bits_strict();
     sBits.in <== s;
-    var topSum = 0;
-    for (var i = 251; i < 254; i++) {
-        topSum += sBits.out[i];
+    component sCmp = CompConstant(2736030358979909402780800718157159386076813972158567259200215660948447373040);
+    for (var i = 0; i < 254; i++) {
+        sCmp.in[i] <== sBits.out[i];
     }
-    component sTopZero = IsZero();
-    sTopZero.in <== topSum;
+    signal sCanonical;
+    sCanonical <== 1 - sCmp.out;
 
     component mulB = EscalarMulFix(251, BASE8);
     for (var i = 0; i < 251; i++) {
@@ -175,5 +185,5 @@ template SchnorrVerify() {
     v1 <== eqx.out * eqy.out;
     v2 <== v1 * ocA.ok;
     v3 <== v2 * ocR.ok;
-    ok <== v3 * sTopZero.out;
+    ok <== v3 * sCanonical;
 }

@@ -297,9 +297,14 @@ fn mul_bits(p: &JubAffine, bits: &[bool]) -> JubProjective {
 }
 
 /// Circuit semantics of the SOFT-SAFE Schnorr verification component:
-/// NEVER unsatisfiable — off-curve points, torsion, identity, or oversized
-/// S simply yield false (matching the circuit's soft flags + muxed complete
-/// double-and-add). For well-formed inputs the result is unchanged.
+/// NEVER unsatisfiable — off-curve points, torsion, identity, or
+/// non-canonical S simply yield false (matching the circuit's soft flags +
+/// muxed complete double-and-add). For well-formed inputs the result is
+/// unchanged. NOTE: given a registration table whose vks are valid
+/// subgroup points (guaranteed at registration, publicly auditable), this
+/// predicate agrees with `crypto::signature::verify` on every ballot that
+/// passes vk_match — on-curve torsion inputs fail the curve equation here
+/// and the subgroup decode there.
 fn circuit_sig_ok(ax: F, ay: F, rx: F, ry: F, s: F, msg: F) -> bool {
     // Inputs are circomlib-form coordinates; map to ark form for arithmetic.
     let a = crate::crypto::signature::from_circom_point(ax, ay);
@@ -307,12 +312,15 @@ fn circuit_sig_ok(ax: F, ay: F, rx: F, ry: F, s: F, msg: F) -> bool {
     if !a.is_on_curve() || !r.is_on_curve() {
         return false; // soft on-curve flags
     }
-    // S: strict decomposition, top-3-bits-zero soft flag; low 251 bits used.
-    let s_all = s.into_bigint().to_bits_le();
-    if s_all.iter().skip(251).take(3).any(|b| *b) {
+    // S: strict decomposition, SOFT canonicity flag (S < subgroup order l,
+    // mirroring the circuit's CompConstant(l-1); implies the low 251 bits
+    // are S itself). Matches the native verifier's canonicity rule, so a
+    // malleated S+l signature is invalid on BOTH sides — never a
+    // circuit/native validity disagreement (which would be unsat = DoS).
+    if !crate::crypto::signature::f_is_canonical_scalar(&s) {
         return false;
     }
-    let s_bits: Vec<bool> = s_all.into_iter().take(251).collect();
+    let s_bits: Vec<bool> = s.into_bigint().to_bits_le().into_iter().take(251).collect();
     let c = poseidon(&[rx, ry, ax, ay, msg]);
     let c_bits = f_bits_le(&c, 254).expect("field elements fit 254 bits");
 

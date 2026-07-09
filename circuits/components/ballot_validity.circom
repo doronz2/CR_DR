@@ -89,8 +89,9 @@ template BallotValidity(depth, nCand) {
     candOk <== candSum;
     m <== mSum;
 
-    // (4) signature over Poseidon(eid, id, candidate, R) (soft flag, hard
-    //     sub-constraints: on-curve, non-identity vk, canonical S)
+    // (4) signature over Poseidon(eid, id, candidate, R): SOFT-SAFE — the
+    //     gadget stays satisfiable for arbitrary field inputs (off-curve
+    //     vk / R, non-canonical S) and just drives ok to 0
     component msgh = MessageHashForSignature();
     msgh.eid_hash <== pt[0];
     msgh.id <== pt[1];

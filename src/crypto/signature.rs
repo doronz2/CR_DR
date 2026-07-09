@@ -140,6 +140,15 @@ pub fn field_from_jub_scalar(s: &JubScalar) -> F {
     F::from_le_bytes_mod_order(&s.into_bigint().to_bytes_le())
 }
 
+/// The BabyJubJub prime subgroup order l as a base-field element. Used by
+/// canonicity tests: s + l is the classic Schnorr signature malleation
+/// ((s+l)*Base8 = s*Base8) that both the circuit and the native verifier
+/// must reject identically.
+pub fn subgroup_order_as_field() -> F {
+    use ark_ff::BigInteger;
+    F::from_le_bytes_mod_order(&JubScalar::MODULUS.to_bytes_le())
+}
+
 /// True iff the integer value of `f` is a canonical scalar (< l).
 pub fn f_is_canonical_scalar(f: &F) -> bool {
     use ark_ff::BigInteger;
@@ -159,6 +168,13 @@ pub fn decode_point(x: F, y: F) -> Option<JubAffine> {
     } else {
         None
     }
+}
+
+/// True iff `vk` is a valid NON-IDENTITY subgroup point — the registration
+/// admission rule for verification keys (publicly auditable on the Reg
+/// table).
+pub fn vk_is_well_formed(vk: &VerificationKey) -> bool {
+    matches!(decode_point(vk.x, vk.y), Some(p) if !p.is_zero())
 }
 
 pub fn keygen<R: RngCore + CryptoRng>(rng: &mut R) -> (SecretKey, VerificationKey) {
