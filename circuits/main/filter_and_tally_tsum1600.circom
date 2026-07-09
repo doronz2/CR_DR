@@ -5,5 +5,5 @@ pragma circom 2.0.0;
 include "./tally_sum_chunk.circom";
 
 component main {
-    public [tc, tally_counts]
+    public [tc, acc_p_cm, acc_q_cm, tally_counts]
 } = TallySum(1600, 3);

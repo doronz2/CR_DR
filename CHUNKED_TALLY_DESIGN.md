@@ -54,9 +54,11 @@ is binding but reveals nothing (records are hashed with a blinding term).
 
 ### Challenge derivation (between phases)
 
-    gamma, delta = H(statement, rc_1, ..., rc_K)
+    gamma, delta = H(statement, rc_1, ..., rc_K, sc_1, ..., sc_K)
 
-Fiat–Shamir over the phase-1 commitments. Soundness of the multiset
+Fiat–Shamir over ALL phase-1 commitments — BOTH the original-order rc_k
+and the sorted-run sc_k precede the challenge (committing only one side
+would let the prover grind the other). Soundness of the multiset
 argument is Schwartz–Zippel over the BN254 scalar field: error
 O(B / |F|) ≈ 2^-230 for B ≤ 2^21. The verifier (or the aggregation
 circuit) recomputes gamma, delta from the rc_k, so the prover cannot
@@ -80,39 +82,74 @@ records s_1..s_C:
    working across runs;
 4. **partial tally**: t_k[c] = sum_i counted_i * [m_i = c], carried OUT
    only as a hiding (Pedersen) commitment `tc_k`;
-5. **multiset accumulators**: the chunk outputs partial grand products
-   over its own records:
-       P_k = prod_i (gamma - (s_i.valid + delta*s_i.id + delta^2*s_i.pos + delta^3*s_i.m))
-   and phase-1 chunks output the same product Q_k over their (original-
-   order) records — either recomputed from rc_k openings in phase 2, or
-   emitted by phase 1 as a second public value once gamma is known (this
-   forces phase 1 to run twice or phase 2 to re-open rc_k; the sketch
-   prefers re-opening rc_k inside the phase-2 chunk, which keeps phase 1
-   single-pass).
+5. **multiset accumulators (hiding running-product chain)**: the chunk
+   continues two RUNNING grand products
+       P_k = P_{k-1} * prod_i (gamma - enc(s_i)),   enc as below,
+       Q_k = Q_{k-1} * prod_i (gamma - enc(orig_i))
+   over its sorted run (P) and its re-opened original records (Q). The
+   running products cross the chunk boundary ONLY as hiding commitments
+   acc_p_cm_k = Poseidon(P_k, blind), acc_q_cm_k = Poseidon(Q_k, blind)
+   — chained exactly like the boundary records (the chain starts at the
+   public commitment to 1 with blind 0). The final tally-sum proof opens
+   acc_p_cm_K and acc_q_cm_K and constrains P_K = Q_K WITHOUT revealing
+   the value: the permutation check yields only its accept bit.
+
+   NOTE — an earlier revision published per-chunk products pp_k =
+   rho_k*P_k and qq_k = rho_k*Q_k with a SHARED blind rho_k, checking
+   prod pp = prod qq publicly. That design leaks: the public ratio
+   pp_k/qq_k = P_k/Q_k is a deterministic function of the private
+   records (enc has no per-record blinding), so anyone holding a guess
+   of the two record multisets of chunk k can CONFIRM the guess against
+   the public ratio — a confirmation channel on exactly the data
+   (per-ballot validity) the protocol hides. The hiding accumulator
+   chain removes the channel at the cost of 4 Poseidon hashes per run
+   proof and 2 openings + 1 equality in the tally-sum proof.
 
 ### Aggregation layer
 
 The aggregator (a verifier program, NOT trusted: everything it checks is
 re-checkable by anyone) verifies:
 
-* all 2K Groth16 proofs (or one SnarkPack aggregate of them, ~40 KB);
-* `bb` chain: bb_0 = 0, adjacent equality, bb_K = bb_commitment;
+* all 2K+1 Groth16 proofs (or one SnarkPack aggregate of them, ~40 KB);
+* `bb` chain: bb_0 = 0, adjacent equality, bb_K = bb_commitment
+  (recomputed from the admitted board itself);
 * boundary chain: adjacent boundary commitments equal; sentinel at 0;
-* challenge: gamma, delta recomputed from (statement, rc_1..rc_K);
-* multiset: prod_k P_k == prod_k Q_k  (the permutation check);
-* tally: sum of Pedersen commitments tc_k opens to the public
-  tally_counts — the homomorphic sum reveals ONLY the total, never a
-  partial tally.
+* product chains: acc_p_cm_0 = acc_q_cm_0 = commit(1, 0); adjacency via
+  the shared publics of consecutive run proofs; equality of the FINAL
+  accumulators proven by the tally-sum circuit (the permutation check);
+* challenge: gamma, delta recomputed from (statement, rc_1..K, sc_1..K);
+* tally: the tally-sum proof opens the tc_k and constrains their sum to
+  the public tally_counts — revealing ONLY the total, never a partial
+  tally.
 
-## Privacy accounting
+This is implemented as `zk::chunked::verify_chunked_public_transcript`
+(public data + proof objects only; `prove_chunked` routes its aggregate
+verification through it, and `tests/chunked_transcript_tests.rs` checks
+every malicious-transcript mutation).
 
-Everything that crosses a chunk boundary is either already public
-(bb chain values are functions of the public board) or a hiding
-commitment (records rc_k, boundary records, partial tallies tc_k, partial
-products — products of blinded terms; gamma-terms include the blinding in
-the hash-committed record encoding). No per-chunk tally, no sorted order,
-no validity bit is revealed. Chunk boundaries themselves are public
-positions on an already-public board.
+## Public values and leakage
+
+The complete public transcript (`zk::chunked::ChunkedTranscript`, audited
+by `chunked_transcript_tests::public_transcript_field_audit`):
+
+| value | what it is | why it does not leak |
+|---|---|---|
+| `bb_0..bb_K` | board-chain snapshots at chunk boundaries | deterministic functions of the PUBLIC admitted board (Poseidon fold of the commitments); anyone can recompute them |
+| `rc_1..rc_K` | per-chunk record commitments (board order) | blinded Poseidon chains — hiding; records never appear |
+| `sc_1..sc_K` | per-run sorted-record commitments | blinded Poseidon chains — hiding; the sorted order never appears |
+| `boundary_cm_0..K` | run-edge record commitments | hiding (fresh blind per link); cm_0 is the public sentinel |
+| `tc_1..tc_K` | partial-tally commitments | hiding; only the SUM is ever opened (by the tally-sum proof) against the public tally |
+| `acc_p_cm_0..K`, `acc_q_cm_0..K` | running grand-product commitments | hiding (fresh blind per link); cm_0 is the public commit(1,0); no product value or per-chunk ratio is public |
+| `gamma`, `delta` | Fiat–Shamir challenges | derived from public data (statement + rc + sc) |
+
+Consequently: accepted identities, per-ballot validity flags, sorted
+records, per-chunk partial tallies, and the nonces R_i / R_EA,i appear
+in NO public transcript value — each is covered by at least one fresh
+uniformly random blind inside a Poseidon commitment, and the only
+non-hiding values (bb chain, challenges) are functions of already-public
+data. Chunk boundaries themselves are public positions on an
+already-public board. The Groth16 proofs are zero-knowledge, so they add
+nothing beyond their public inputs.
 
 ## Cost model (from BENCHMARKS.md rates)
 

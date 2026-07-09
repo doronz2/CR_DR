@@ -14,7 +14,9 @@ component main {
         boundary_in_cm,
         boundary_out_cm,
         tc,
-        pp,
-        qq
+        acc_p_in_cm,
+        acc_p_out_cm,
+        acc_q_in_cm,
+        acc_q_out_cm
     ]
 } = SortedRunChunk(128, 3);

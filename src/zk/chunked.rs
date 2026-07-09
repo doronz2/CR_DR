@@ -14,16 +14,20 @@
 //!   phase 2  K x SortedRunChunk   — re-opens rc_k and sc_k, hiding
 //!            boundary-record chain, in-run + cross-run sortedness,
 //!            first-valid counting, hiding partial-tally commitment tc_k,
-//!            blinded grand products pp_k (sorted side) / qq_k (original);
+//!            hiding RUNNING grand-product chain (acc_p sorted side /
+//!            acc_q original side, commitments only);
 //!   final    1 x TallySum         — opens tc_1..K, constrains the SUM to
-//!            the public tally_counts;
+//!            the public tally_counts, opens the two final product
+//!            accumulators and constrains them EQUAL (the permutation
+//!            check, without revealing any product value);
 //!   aggregate: verify all proofs; bb chain 0 -> bb_commitment; rc/sc
-//!            consistency; boundary chain from the sentinel; recompute
-//!            (gamma, delta); prod pp == prod qq; tally_counts.
+//!            consistency; boundary chain from the sentinel; product
+//!            chains from commit(1,0); recompute (gamma, delta);
+//!            tally_counts.
 //!
-//! Nothing private crosses a chunk boundary in the clear: rc/sc/tc and the
-//! boundary records are hiding commitments, and the public products are
-//! blinded by a shared nonzero rho per chunk.
+//! Nothing private crosses a chunk boundary in the clear: rc/sc/tc, the
+//! boundary records and the running products are hiding commitments — no
+//! product value or per-chunk product ratio is ever public.
 
 use ark_ff::{UniformRand, Zero};
 use rand::{CryptoRng, RngCore};
@@ -69,9 +73,17 @@ pub struct ChunkedTally {
     pub boundary_blind: Vec<F>,
     pub gamma: F,
     pub delta: F,
-    pub rho: Vec<F>,
-    pub pp: Vec<F>,
-    pub qq: Vec<F>,
+    /// Running grand-product VALUES p_0..p_K / q_0..q_K (p_0 = q_0 = 1) —
+    /// private; they cross chunk boundaries only as the hiding commitments
+    /// below.
+    pub acc_p: Vec<F>,
+    pub acc_q: Vec<F>,
+    /// Blinds b_0..b_K (b_0 = 0: the chain start is public).
+    pub acc_p_blind: Vec<F>,
+    pub acc_q_blind: Vec<F>,
+    /// Hiding running-product commitments cp_0..cp_K / cq_0..cq_K.
+    pub acc_p_cm: Vec<F>,
+    pub acc_q_cm: Vec<F>,
     pub partial_tallies: Vec<Vec<u64>>,
     pub tally_blind: Vec<F>,
     pub tc: Vec<F>,
@@ -100,6 +112,12 @@ pub fn record_commit(r: &Rec, blind: F) -> F {
 /// The public sentinel boundary commitment (blind 0, known to everyone).
 pub fn sentinel_commitment() -> F {
     record_commit(&Rec::SENTINEL, F::zero())
+}
+
+/// The public start of both running-product commitment chains:
+/// commit(value 1, blind 0), known to everyone (like the sentinel).
+pub fn product_chain_start() -> F {
+    poseidon(&[F::from(1u64), F::zero()])
 }
 
 /// enc(r) = valid + delta*id + delta^2*pos + delta^3*m
@@ -219,11 +237,14 @@ pub fn build_chunked_tally<R: RngCore + CryptoRng>(
         boundary_blind.push(b);
     }
 
-    // Per-run counting, partial tallies, products.
+    // Per-run counting, partial tallies, hiding running-product chains.
     let n_cand = pp.candidates.len();
-    let mut rho = Vec::new();
-    let mut pps = Vec::new();
-    let mut qqs = Vec::new();
+    let mut acc_p = vec![F::from(1u64)];
+    let mut acc_q = vec![F::from(1u64)];
+    let mut acc_p_blind = vec![F::zero()];
+    let mut acc_q_blind = vec![F::zero()];
+    let mut acc_p_cm = vec![product_chain_start()];
+    let mut acc_q_cm = vec![product_chain_start()];
     let mut partial_tallies = Vec::new();
     let mut tally_blind = Vec::new();
     let mut tc = Vec::new();
@@ -238,21 +259,20 @@ pub fn build_chunked_tally<R: RngCore + CryptoRng>(
             }
             prev = *r;
         }
-        let rk = loop {
-            let x = F::rand(rng);
-            if !x.is_zero() {
-                break x;
-            }
-        };
-        let mut p = rk;
-        let mut q = rk;
+        let mut p = acc_p[k];
+        let mut q = acc_q[k];
         for (s, o) in run.iter().zip(orig) {
             p *= gamma - enc(s, delta);
             q *= gamma - enc(o, delta);
         }
-        rho.push(rk);
-        pps.push(p);
-        qqs.push(q);
+        let pb = F::rand(rng);
+        let qb = F::rand(rng);
+        acc_p_cm.push(poseidon(&[p, pb]));
+        acc_q_cm.push(poseidon(&[q, qb]));
+        acc_p.push(p);
+        acc_q.push(q);
+        acc_p_blind.push(pb);
+        acc_q_blind.push(qb);
         let tb = F::rand(rng);
         let mut inputs: Vec<F> = t.iter().map(|x| F::from(*x)).collect();
         inputs.push(tb);
@@ -279,9 +299,12 @@ pub fn build_chunked_tally<R: RngCore + CryptoRng>(
         boundary_blind,
         gamma,
         delta,
-        rho,
-        pp: pps,
-        qq: qqs,
+        acc_p,
+        acc_q,
+        acc_p_blind,
+        acc_q_blind,
+        acc_p_cm,
+        acc_q_cm,
         partial_tallies,
         tally_blind,
         tc,
@@ -357,9 +380,16 @@ pub fn chunked_relation_check_native(ct: &ChunkedTally) -> bool {
     if ct.boundary_cm[0] != sentinel_commitment() {
         return false;
     }
+    if ct.acc_p_cm.len() != k_chunks + 1
+        || ct.acc_q_cm.len() != k_chunks + 1
+        || ct.acc_p_cm[0] != product_chain_start()
+        || ct.acc_q_cm[0] != product_chain_start()
+        || ct.acc_p[0] != F::from(1u64)
+        || ct.acc_q[0] != F::from(1u64)
+    {
+        return false;
+    }
     let mut total = vec![0u64; ct.candidates.len()];
-    let mut prod_p = F::from(1u64);
-    let mut prod_q = F::from(1u64);
     for k in 0..k_chunks {
         let run = &ct.sorted[k * c..(k + 1) * c];
         let orig = &ct.records[k * c..(k + 1) * c];
@@ -410,25 +440,30 @@ pub fn chunked_relation_check_native(ct: &ChunkedTally) -> bool {
         for (i, x) in t.iter().enumerate() {
             total[i] += x;
         }
-        // products
-        if ct.rho[k].is_zero() {
+        // running products: chain openings + per-run multiplication
+        if poseidon(&[ct.acc_p[k], ct.acc_p_blind[k]]) != ct.acc_p_cm[k]
+            || poseidon(&[ct.acc_q[k], ct.acc_q_blind[k]]) != ct.acc_q_cm[k]
+        {
             return false;
         }
-        let mut p = ct.rho[k];
-        let mut q = ct.rho[k];
+        let mut p = ct.acc_p[k];
+        let mut q = ct.acc_q[k];
         for (s, o) in run.iter().zip(orig) {
             p *= gamma - enc(s, delta);
             q *= gamma - enc(o, delta);
         }
-        if p != ct.pp[k] || q != ct.qq[k] {
+        if p != ct.acc_p[k + 1]
+            || q != ct.acc_q[k + 1]
+            || poseidon(&[p, ct.acc_p_blind[k + 1]]) != ct.acc_p_cm[k + 1]
+            || poseidon(&[q, ct.acc_q_blind[k + 1]]) != ct.acc_q_cm[k + 1]
+        {
             return false;
         }
-        prod_p *= p;
-        prod_q *= q;
     }
 
-    // ---- aggregate checks
-    if prod_p != prod_q {
+    // ---- aggregate checks: grand-product / permutation equality (proven
+    //      by the tally-sum circuit over the FINAL accumulators) + tally
+    if ct.acc_p[k_chunks] != ct.acc_q[k_chunks] {
         return false;
     }
     if total != st.tally_counts {
@@ -443,11 +478,6 @@ pub fn chunked_relation_check_native(ct: &ChunkedTally) -> bool {
 
 fn dec(f: &F) -> Value {
     Value::String(f_to_dec(f))
-}
-
-fn field_inv(x: F) -> F {
-    use ark_ff::Field;
-    x.inverse().expect("rho is nonzero by construction")
 }
 
 fn recs_json(recs: &[Rec]) -> Value {
@@ -497,7 +527,6 @@ pub fn validity_chunk_input(ct: &ChunkedTally, k: usize) -> Value {
 pub fn sorted_run_input(ct: &ChunkedTally, k: usize) -> Value {
     let c = ct.chunk_size;
     let bnd_in = if k == 0 { Rec::SENTINEL } else { ct.sorted[k * c - 1] };
-    let rho_inv = field_inv(ct.rho[k]);
     json!({
         "gamma": dec(&ct.gamma),
         "delta": dec(&ct.delta),
@@ -506,8 +535,10 @@ pub fn sorted_run_input(ct: &ChunkedTally, k: usize) -> Value {
         "boundary_in_cm": dec(&ct.boundary_cm[k]),
         "boundary_out_cm": dec(&ct.boundary_cm[k + 1]),
         "tc": dec(&ct.tc[k]),
-        "pp": dec(&ct.pp[k]),
-        "qq": dec(&ct.qq[k]),
+        "acc_p_in_cm": dec(&ct.acc_p_cm[k]),
+        "acc_p_out_cm": dec(&ct.acc_p_cm[k + 1]),
+        "acc_q_in_cm": dec(&ct.acc_q_cm[k]),
+        "acc_q_out_cm": dec(&ct.acc_q_cm[k + 1]),
         "orig": recs_json(&ct.records[k * c..(k + 1) * c]),
         "rc_blind": dec(&ct.rc_blind[k]),
         "sorted": recs_json(&ct.sorted[k * c..(k + 1) * c]),
@@ -521,55 +552,331 @@ pub fn sorted_run_input(ct: &ChunkedTally, k: usize) -> Value {
         "bnd_in_blind": dec(&ct.boundary_blind[k]),
         "bnd_out_blind": dec(&ct.boundary_blind[k + 1]),
         "tally_blind": dec(&ct.tally_blind[k]),
-        "rho_blind": dec(&ct.rho[k]),
-        "rho_inv": dec(&rho_inv),
+        "acc_p_in": dec(&ct.acc_p[k]),
+        "acc_p_in_blind": dec(&ct.acc_p_blind[k]),
+        "acc_p_out_blind": dec(&ct.acc_p_blind[k + 1]),
+        "acc_q_in": dec(&ct.acc_q[k]),
+        "acc_q_in_blind": dec(&ct.acc_q_blind[k]),
+        "acc_q_out_blind": dec(&ct.acc_q_blind[k + 1]),
     })
 }
 
 /// input.json for TallySum.
 pub fn tally_sum_input(ct: &ChunkedTally) -> Value {
+    let k = ct.k_chunks;
     json!({
         "tc": ct.tc.iter().map(dec).collect::<Vec<_>>(),
+        "acc_p_cm": dec(&ct.acc_p_cm[k]),
+        "acc_q_cm": dec(&ct.acc_q_cm[k]),
         "tally_counts": ct.statement.tally_counts.iter().map(|x| x.to_string()).collect::<Vec<_>>(),
         "t": ct.partial_tallies.iter().map(|t| Value::Array(t.iter().map(|x| Value::String(x.to_string())).collect())).collect::<Vec<_>>(),
         "blind": ct.tally_blind.iter().map(dec).collect::<Vec<_>>(),
+        "acc_p": dec(&ct.acc_p[k]),
+        "acc_p_blind": dec(&ct.acc_p_blind[k]),
+        "acc_q": dec(&ct.acc_q[k]),
+        "acc_q_blind": dec(&ct.acc_q_blind[k]),
     })
 }
 
 /// The exact snarkjs public.json a ValidityChunk-k proof must carry.
 pub fn validity_chunk_publics(ct: &ChunkedTally, k: usize) -> Vec<String> {
-    vec![
-        f_to_dec(&ct.statement.eid_hash),
-        f_to_dec(&ct.statement.mr),
-        f_to_dec(&ct.statement.candidate_set_commitment),
-        ct.statement.num_ballots.to_string(),
-        ct.statement.num_voters.to_string(),
-        ct.statement.duplicate_rule_id.to_string(),
-        (k * ct.chunk_size).to_string(),
-        f_to_dec(&ct.bb[k]),
-        f_to_dec(&ct.bb[k + 1]),
-        f_to_dec(&ct.rc[k]),
-    ]
+    transcript_validity_publics(&ct.statement, &ct.transcript(), k)
 }
 
 /// The exact snarkjs public.json a SortedRunChunk-k proof must carry.
 pub fn sorted_run_publics(ct: &ChunkedTally, k: usize) -> Vec<String> {
-    vec![
-        f_to_dec(&ct.gamma),
-        f_to_dec(&ct.delta),
-        f_to_dec(&ct.rc[k]),
-        f_to_dec(&ct.sc[k]),
-        f_to_dec(&ct.boundary_cm[k]),
-        f_to_dec(&ct.boundary_cm[k + 1]),
-        f_to_dec(&ct.tc[k]),
-        f_to_dec(&ct.pp[k]),
-        f_to_dec(&ct.qq[k]),
-    ]
+    transcript_sorted_run_publics(&ct.transcript(), k)
 }
 
 /// The exact snarkjs public.json the TallySum proof must carry.
 pub fn tally_sum_publics(ct: &ChunkedTally) -> Vec<String> {
-    let mut v: Vec<String> = ct.tc.iter().map(f_to_dec).collect();
-    v.extend(ct.statement.tally_counts.iter().map(|x| x.to_string()));
+    transcript_tally_sum_publics(&ct.statement, &ct.transcript())
+}
+
+// ---------------------------------------------------------------------------
+// PUBLIC transcript + public-data-only aggregate verification
+// ---------------------------------------------------------------------------
+
+/// The PUBLIC transcript of a chunked tally: exactly the values that appear
+/// in the 2K+1 proofs' public inputs, and nothing else. Contains NO witness
+/// objects — every field is posted alongside the proofs.
+///
+/// What each public value is, and what stays hidden:
+///   * `bb[0..=K]`  — board-chain snapshots at chunk boundaries. PUBLICLY
+///     RECOMPUTABLE from BB_adm alone (fold of Poseidon over the admitted
+///     commitments), so they reveal nothing beyond BB_adm itself.
+///   * `rc[k]`, `sc[k]` — HIDING (blinded) Poseidon chain commitments to
+///     the chunk's board-order records and to the k-th sorted run.
+///   * `boundary_cm[0..=K]` — HIDING commitments to the record at each run
+///     boundary (`boundary_cm[0]` is the public sentinel with blind 0).
+///   * `tc[k]` — HIDING commitments to the per-run partial tallies.
+///   * `gamma`, `delta` — Fiat-Shamir challenges, recomputable from the
+///     statement and rc/sc.
+///   * `acc_p_cm[0..=K]`, `acc_q_cm[0..=K]` — HIDING commitments to the
+///     running grand products of `gamma - enc(record)` over the sorted
+///     runs / board chunks. `acc_*_cm[0]` is the public chain start
+///     (value 1, blind 0); no product VALUE or per-chunk ratio is ever
+///     public — equality of the two final accumulators is proven inside
+///     the tally-sum circuit.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ChunkedTranscript {
+    pub chunk_size: usize,
+    #[serde(with = "crate::types::fserde_vec")]
+    pub bb: Vec<F>,
+    #[serde(with = "crate::types::fserde_vec")]
+    pub rc: Vec<F>,
+    #[serde(with = "crate::types::fserde_vec")]
+    pub sc: Vec<F>,
+    #[serde(with = "crate::types::fserde_vec")]
+    pub boundary_cm: Vec<F>,
+    #[serde(with = "crate::types::fserde_vec")]
+    pub tc: Vec<F>,
+    #[serde(with = "crate::types::fserde_vec")]
+    pub acc_p_cm: Vec<F>,
+    #[serde(with = "crate::types::fserde_vec")]
+    pub acc_q_cm: Vec<F>,
+    #[serde(with = "crate::types::fserde")]
+    pub gamma: F,
+    #[serde(with = "crate::types::fserde")]
+    pub delta: F,
+}
+
+impl ChunkedTally {
+    /// Extract the public transcript (what the prover posts).
+    pub fn transcript(&self) -> ChunkedTranscript {
+        ChunkedTranscript {
+            chunk_size: self.chunk_size,
+            bb: self.bb.clone(),
+            rc: self.rc.clone(),
+            sc: self.sc.clone(),
+            boundary_cm: self.boundary_cm.clone(),
+            tc: self.tc.clone(),
+            acc_p_cm: self.acc_p_cm.clone(),
+            acc_q_cm: self.acc_q_cm.clone(),
+            gamma: self.gamma,
+            delta: self.delta,
+        }
+    }
+}
+
+/// The 2K+1 proof objects of a chunked tally, each with the public.json
+/// the prover emitted for it.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ChunkedProofs {
+    pub validity: Vec<(Value, Value)>,
+    pub sorted_run: Vec<(Value, Value)>,
+    pub tally_sum: (Value, Value),
+}
+
+/// Which chunk circuit a proof belongs to (selects the verification key).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChunkKind {
+    Validity,
+    SortedRun,
+    TallySum,
+}
+
+/// Expected public inputs of ValidityChunk k, from PUBLIC data only.
+pub fn transcript_validity_publics(
+    st: &TallyStatement,
+    tr: &ChunkedTranscript,
+    k: usize,
+) -> Vec<String> {
+    vec![
+        f_to_dec(&st.eid_hash),
+        f_to_dec(&st.mr),
+        f_to_dec(&st.candidate_set_commitment),
+        st.num_ballots.to_string(),
+        st.num_voters.to_string(),
+        st.duplicate_rule_id.to_string(),
+        (k * tr.chunk_size).to_string(),
+        f_to_dec(&tr.bb[k]),
+        f_to_dec(&tr.bb[k + 1]),
+        f_to_dec(&tr.rc[k]),
+    ]
+}
+
+/// Expected public inputs of SortedRunChunk k, from PUBLIC data only.
+pub fn transcript_sorted_run_publics(tr: &ChunkedTranscript, k: usize) -> Vec<String> {
+    vec![
+        f_to_dec(&tr.gamma),
+        f_to_dec(&tr.delta),
+        f_to_dec(&tr.rc[k]),
+        f_to_dec(&tr.sc[k]),
+        f_to_dec(&tr.boundary_cm[k]),
+        f_to_dec(&tr.boundary_cm[k + 1]),
+        f_to_dec(&tr.tc[k]),
+        f_to_dec(&tr.acc_p_cm[k]),
+        f_to_dec(&tr.acc_p_cm[k + 1]),
+        f_to_dec(&tr.acc_q_cm[k]),
+        f_to_dec(&tr.acc_q_cm[k + 1]),
+    ]
+}
+
+/// Expected public inputs of the TallySum proof, from PUBLIC data only.
+pub fn transcript_tally_sum_publics(st: &TallyStatement, tr: &ChunkedTranscript) -> Vec<String> {
+    let k = tr.rc.len();
+    let mut v: Vec<String> = tr.tc.iter().map(f_to_dec).collect();
+    v.push(f_to_dec(&tr.acc_p_cm[k]));
+    v.push(f_to_dec(&tr.acc_q_cm[k]));
+    v.extend(st.tally_counts.iter().map(|x| x.to_string()));
     v
+}
+
+/// STRUCTURAL public checks over (statement, admitted board, transcript) —
+/// everything except the Groth16 proof verifications and the exact
+/// per-proof publics binding (which `verify_chunked_public_transcript`
+/// adds). Uses only public data:
+///
+///   * length/shape consistency of the transcript vectors;
+///   * the board chain: bb[0] = 0, every bb[k] equals the Poseidon fold of
+///     the admitted commitments up to slot k*C (recomputed from BB_adm —
+///     this is what makes a dropped/duplicated admitted commitment
+///     detectable), and bb[K] = statement.bb_commitment;
+///   * boundary chain start: boundary_cm[0] is the public sentinel;
+///   * product chain starts: acc_p_cm[0] = acc_q_cm[0] = the public
+///     commitment to (1, blind 0) — the grand-product/permutation
+///     equality itself is proven by the tally-sum circuit over the FINAL
+///     accumulator commitments (bound via that proof's publics);
+///   * Fiat-Shamir: (gamma, delta) re-derived from statement + rc + sc.
+///
+/// LEAKAGE: every per-chunk value that depends on private records is a
+/// HIDING commitment; no product value or ratio is public (an earlier
+/// design published same-blind product pairs whose ratio leaked — see
+/// CHUNKED_TALLY_DESIGN.md, "Public values and leakage").
+pub fn check_chunked_transcript(
+    st: &TallyStatement,
+    admitted: &AdmittedBoard,
+    tr: &ChunkedTranscript,
+) -> bool {
+    let k_chunks = tr.rc.len();
+    if k_chunks == 0
+        || tr.chunk_size == 0
+        || tr.bb.len() != k_chunks + 1
+        || tr.sc.len() != k_chunks
+        || tr.boundary_cm.len() != k_chunks + 1
+        || tr.tc.len() != k_chunks
+        || tr.acc_p_cm.len() != k_chunks + 1
+        || tr.acc_q_cm.len() != k_chunks + 1
+    {
+        return false;
+    }
+    if st.num_ballots as usize != admitted.len()
+        || admitted.len() > k_chunks * tr.chunk_size
+        || st.num_ballots >= 1 << 24
+    {
+        return false;
+    }
+
+    // Board chain recomputed from the admitted board itself.
+    if tr.bb[0] != F::zero() {
+        return false;
+    }
+    let mut acc = F::zero();
+    for (j, com) in admitted.coms.iter().enumerate() {
+        acc = poseidon(&[acc, *com]);
+        if (j + 1) % tr.chunk_size == 0 && tr.bb[(j + 1) / tr.chunk_size] != acc {
+            return false;
+        }
+    }
+    // Chunks past the last admitted commitment carry the final value.
+    let full = admitted.len() / tr.chunk_size;
+    for k in full + 1..=k_chunks {
+        if tr.bb[k] != acc {
+            return false;
+        }
+    }
+    if tr.bb[k_chunks] != st.bb_commitment {
+        return false;
+    }
+
+    // Boundary chain starts at the public sentinel; product chains start
+    // at the public commitment to 1.
+    if tr.boundary_cm[0] != sentinel_commitment()
+        || tr.acc_p_cm[0] != product_chain_start()
+        || tr.acc_q_cm[0] != product_chain_start()
+    {
+        return false;
+    }
+
+    // Fiat-Shamir challenges.
+    let (gamma, delta) = derive_challenges(st, &tr.rc, &tr.sc);
+    gamma == tr.gamma && delta == tr.delta
+}
+
+/// PUBLIC aggregate verification of a chunked tally:
+///
+///   1-3. every validity-chunk / sorted-run / tally-sum proof verifies
+///        (via `verify`, which wraps the Groth16 verifier + the circuit's
+///        verification key for `ChunkKind`);
+///   4.   each proof's public inputs are EXACTLY the transcript-derived
+///        expected publics (so chunk_base_k = k*chunk_size, board-chain
+///        continuity bb_out(k) = bb_in(k+1), boundary-chain continuity
+///        cm_out(k) = cm_in(k+1), and the challenge binding are all forced
+///        — the expected publics are built from the single transcript
+///        vectors);
+///   5-11. the structural checks of `check_chunked_transcript` (board
+///        chain from BB_adm, sentinel, product-chain starts, Fiat-Shamir
+///        derivation) — the grand-product/permutation equality is proven
+///        by the tally-sum circuit over the final accumulator commitments,
+///        and the final tally binding comes from the tally-sum publics
+///        which end in statement.tally_counts.
+///
+/// Uses ONLY public data and proof objects. The caller separately checks
+/// `statement_matches_public_data(statement, ...)` to bind the statement
+/// itself to the published election data.
+pub fn verify_chunked_public_transcript<Fv>(
+    st: &TallyStatement,
+    admitted: &AdmittedBoard,
+    tr: &ChunkedTranscript,
+    proofs: &ChunkedProofs,
+    mut verify: Fv,
+) -> Result<bool>
+where
+    Fv: FnMut(ChunkKind, &Value, &Value) -> Result<bool>,
+{
+    if !check_chunked_transcript(st, admitted, tr) {
+        return Ok(false);
+    }
+    let k_chunks = tr.rc.len();
+    if proofs.validity.len() != k_chunks || proofs.sorted_run.len() != k_chunks {
+        return Ok(false);
+    }
+
+    let publics_match = |carried: &Value, expected: &[String]| -> bool {
+        carried
+            .as_array()
+            .map(|a| {
+                a.len() == expected.len()
+                    && a.iter()
+                        .zip(expected)
+                        .all(|(v, e)| v.as_str() == Some(e.as_str()))
+            })
+            .unwrap_or(false)
+    };
+
+    for (k, (proof, public)) in proofs.validity.iter().enumerate() {
+        if !publics_match(public, &transcript_validity_publics(st, tr, k)) {
+            return Ok(false);
+        }
+        if !verify(ChunkKind::Validity, proof, public)? {
+            return Ok(false);
+        }
+    }
+    for (k, (proof, public)) in proofs.sorted_run.iter().enumerate() {
+        if !publics_match(public, &transcript_sorted_run_publics(tr, k)) {
+            return Ok(false);
+        }
+        if !verify(ChunkKind::SortedRun, proof, public)? {
+            return Ok(false);
+        }
+    }
+    let (proof, public) = &proofs.tally_sum;
+    if !publics_match(public, &transcript_tally_sum_publics(st, tr)) {
+        return Ok(false);
+    }
+    if !verify(ChunkKind::TallySum, proof, public)? {
+        return Ok(false);
+    }
+    Ok(true)
 }

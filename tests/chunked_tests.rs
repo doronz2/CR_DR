@@ -178,7 +178,6 @@ fn rebuild_phase2(ct: &mut ChunkedTally, rng: &mut ChaCha20Rng) {
         inputs.push(ct.tally_blind[k]);
         ct.tc[k] = cr_dr::crypto::poseidon_native::poseidon(&inputs);
         ct.partial_tallies[k] = t;
-        let rho = F::rand(rng);
         let d2 = ct.delta * ct.delta;
         let d3 = d2 * ct.delta;
         let encf = |r: &Rec| {
@@ -187,14 +186,19 @@ fn rebuild_phase2(ct: &mut ChunkedTally, rng: &mut ChaCha20Rng) {
                 + d2 * F::from(r.pos)
                 + d3 * F::from(r.m)
         };
-        let mut p = rho;
-        let mut q = rho;
+        let mut p = ct.acc_p[k];
+        let mut q = ct.acc_q[k];
         for (s, o) in run.iter().zip(&orig) {
             p *= ct.gamma - encf(s);
             q *= ct.gamma - encf(o);
         }
-        ct.rho[k] = rho;
-        ct.pp[k] = p;
-        ct.qq[k] = q;
+        let pb = F::rand(rng);
+        let qb = F::rand(rng);
+        ct.acc_p[k + 1] = p;
+        ct.acc_q[k + 1] = q;
+        ct.acc_p_blind[k + 1] = pb;
+        ct.acc_q_blind[k + 1] = qb;
+        ct.acc_p_cm[k + 1] = cr_dr::crypto::poseidon_native::poseidon(&[p, pb]);
+        ct.acc_q_cm[k + 1] = cr_dr::crypto::poseidon_native::poseidon(&[q, qb]);
     }
 }

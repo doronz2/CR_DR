@@ -182,26 +182,32 @@ fn main() -> anyhow::Result<()> {
     let prove_time = t2.elapsed();
     let proofs = proofs.into_inner().unwrap();
 
-    // ---- aggregate verification ----
+    // ---- PUBLIC aggregate verification: statement + admitted board +
+    //      public transcript + proof objects only (no witness data) ----
     let t3 = Instant::now();
-    let mut ok = true;
-    for (i, pv) in proofs.iter().enumerate() {
-        let (proof, public) = pv.as_ref().expect("all proved");
-        let (be, expected) = if i < k {
-            (&vb, validity_chunk_publics(&ct, i))
-        } else if i < 2 * k {
-            (&sb, sorted_run_publics(&ct, i - k))
-        } else {
-            (&tb, tally_sum_publics(&ct))
-        };
-        ok &= public
-            .as_array()
-            .map(|a| a.iter().map(|v| v.as_str().unwrap_or("")).eq(expected.iter().map(|s| s.as_str())))
-            .unwrap_or(false);
-        ok &= be.verify(proof, public)?;
-    }
+    let mut proofs = proofs.into_iter().map(|pv| pv.expect("all proved"));
+    let chunked_proofs = ChunkedProofs {
+        validity: proofs.by_ref().take(k).collect(),
+        sorted_run: proofs.by_ref().take(k).collect(),
+        tally_sum: proofs.next().expect("tally-sum proof"),
+    };
+    let transcript = ct.transcript();
+    let ok = verify_chunked_public_transcript(
+        &ct.statement,
+        &admitted,
+        &transcript,
+        &chunked_proofs,
+        |kind, proof, public| {
+            let be = match kind {
+                ChunkKind::Validity => &vb,
+                ChunkKind::SortedRun => &sb,
+                ChunkKind::TallySum => &tb,
+            };
+            be.verify(proof, public)
+        },
+    )?;
     let verify_time = t3.elapsed();
-    anyhow::ensure!(ok, "aggregate verification failed");
+    anyhow::ensure!(ok, "public aggregate verification failed");
 
     println!(
         "PROVED {} ballots (K={k}, {total} proofs): prove {:.1}s wall ({:.2}s/chunk-pair \

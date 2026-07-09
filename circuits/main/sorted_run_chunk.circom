@@ -10,8 +10,10 @@ pragma circom 2.0.0;
 //   * permutation: grand products P (sorted side) and Q (original side)
 //     under challenge (gamma, delta) derived AFTER both rc (original
 //     order, from validity chunks) and sc (sorted runs, this circuit's
-//     re-opened commitment) are fixed — the aggregator checks
-//     prod_k P_k == prod_k Q_k;
+//     re-opened commitment) are fixed. The running products cross chunk
+//     boundaries ONLY as HIDING commitments (acc chain, like the boundary
+//     records); tally_sum_chunk.circom proves the two final accumulators
+//     are equal without revealing them;
 //   * sortedness: in-run adjacent key comparisons plus a hiding
 //     boundary-record commitment chain across runs;
 //   * first-valid counting on adjacent sorted records (the boundary
@@ -24,9 +26,12 @@ pragma circom 2.0.0;
 // pos < 2^24 — all range-checked here, so comparators are sound
 // independently of the permutation argument.
 //
-// Public products pp/qq are both blinded by the same nonzero rho_blind,
-// so prod pp == prod qq iff prod P == prod Q while individual products
-// reveal nothing.
+// LEAKAGE: no product value (or ratio of products) is ever public. An
+// earlier design published pp_k = rho_k*P_k and qq_k = rho_k*Q_k, whose
+// PUBLIC ratio P_k/Q_k is a deterministic function of the private records
+// and admits multiset-guess confirmation; the hiding accumulator chain
+// removes that channel (see CHUNKED_TALLY_DESIGN.md, "Public values and
+// leakage").
 
 include "circomlib/circuits/poseidon.circom";
 include "circomlib/circuits/comparators.circom";
@@ -42,8 +47,10 @@ template SortedRunChunk(C, nC) {
     signal input boundary_in_cm;    // hiding commitment to predecessor record
     signal input boundary_out_cm;   // hiding commitment to this run's last record
     signal input tc;                // hiding commitment to the partial tally
-    signal input pp;                // rho_blind * prod (gamma - enc(sorted_i))
-    signal input qq;                // rho_blind * prod (gamma - enc(orig_j))
+    signal input acc_p_in_cm;       // hiding commitment to the incoming
+    signal input acc_p_out_cm;      //   / outgoing SORTED-side running product
+    signal input acc_q_in_cm;       // hiding commitment to the incoming
+    signal input acc_q_out_cm;      //   / outgoing ORIGINAL-side running product
 
     // ---------------- private witness ----------------
     signal input orig[C][4];        // chunk k's records, board order
@@ -54,10 +61,12 @@ template SortedRunChunk(C, nC) {
     signal input bnd_in_blind;
     signal input bnd_out_blind;
     signal input tally_blind;
-    signal input rho_blind;
-    signal input rho_inv;           // forces rho_blind != 0
-
-    rho_blind * rho_inv === 1;
+    signal input acc_p_in;          // incoming running products + blinds
+    signal input acc_p_in_blind;
+    signal input acc_p_out_blind;
+    signal input acc_q_in;
+    signal input acc_q_in_blind;
+    signal input acc_q_out_blind;
 
     // -------- re-open both phase-1 commitments (binding to pre-challenge data)
     component rchain = RecordChain(C);
@@ -163,8 +172,18 @@ template SortedRunChunk(C, nC) {
     tcm.inputs[nC] <== tally_blind;
     tcm.out === tc;
 
-    // -------- grand products under (gamma, delta), blinded by rho_blind
+    // -------- running grand products under (gamma, delta), crossing the
+    //          chunk boundary only as HIDING commitments
     // enc(r) = valid + delta*id + delta^2*pos + delta^3*m
+    component pIn = Poseidon(2);
+    pIn.inputs[0] <== acc_p_in;
+    pIn.inputs[1] <== acc_p_in_blind;
+    pIn.out === acc_p_in_cm;
+    component qIn = Poseidon(2);
+    qIn.inputs[0] <== acc_q_in;
+    qIn.inputs[1] <== acc_q_in_blind;
+    qIn.out === acc_q_in_cm;
+
     signal d2;
     signal d3;
     d2 <== delta * delta;
@@ -179,8 +198,8 @@ template SortedRunChunk(C, nC) {
     signal encO[C];
     signal accP[C + 1];
     signal accQ[C + 1];
-    accP[0] <== rho_blind;
-    accQ[0] <== rho_blind;
+    accP[0] <== acc_p_in;
+    accQ[0] <== acc_q_in;
     for (var j = 0; j < C; j++) {
         sId[j] <== delta * sorted[j][1];
         sPos[j] <== d2 * sorted[j][2];
@@ -193,6 +212,13 @@ template SortedRunChunk(C, nC) {
         accP[j + 1] <== accP[j] * (gamma - encS[j]);
         accQ[j + 1] <== accQ[j] * (gamma - encO[j]);
     }
-    accP[C] === pp;
-    accQ[C] === qq;
+
+    component pOut = Poseidon(2);
+    pOut.inputs[0] <== accP[C];
+    pOut.inputs[1] <== acc_p_out_blind;
+    pOut.out === acc_p_out_cm;
+    component qOut = Poseidon(2);
+    qOut.inputs[0] <== accQ[C];
+    qOut.inputs[1] <== acc_q_out_blind;
+    qOut.out === acc_q_out_cm;
 }
