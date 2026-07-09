@@ -125,7 +125,6 @@ pub fn verify_cast_entry(
     if !bound {
         return Ok(false);
     }
-    use ark_ff::Zero;
     let c1_ok = matches!(
         crate::crypto::signature::decode_point(entry.ct_open.c1x, entry.ct_open.c1y),
         Some(p) if !p.is_zero()

@@ -20,11 +20,12 @@ mkdir -p "$PTAU_DIR"
 
 [ -f "$OUT/${NAME}.r1cs" ] || { echo "run scripts/compile_circuits.sh ${VARIANT} first"; exit 1; }
 
-# Pick the smallest power of tau that fits the constraint count.
+# Pick the smallest power of tau whose domain fits the constraint count
+# (snarkjs domain = next power of two >= constraints + public wires; the
+# +512 slack covers the public wires without jumping a whole power).
 CONSTRAINTS=$($SNARKJS r1cs info "$OUT/${NAME}.r1cs" | sed -n 's/.*# of Constraints: *//p' | tr -d '[:space:]')
 POWER=12
-while [ $((1 << POWER)) -lt "$CONSTRAINTS" ]; do POWER=$((POWER + 1)); done
-POWER=$((POWER + 1))   # headroom for witness/public wires
+while [ $((1 << POWER)) -lt $((CONSTRAINTS + 512)) ]; do POWER=$((POWER + 1)); done
 echo "constraints: $CONSTRAINTS -> using power 2^$POWER"
 
 PTAU_FINAL="$PTAU_DIR/pot${POWER}_final.ptau"
