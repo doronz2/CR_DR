@@ -17,17 +17,19 @@ proving is claimed or benchmarked.**
 > no per-voter ZK cost; its recorded-as-cast machinery is plain
 > signatures (<1 ms).
 >
-> **FORMAT CHANGE (CAST-ZK).** The ballot format is now
+> **FORMAT CHANGE (CAST-ZK).** The ballot format is
 > B_j = (com, ct_open, pi_cast): real BabyJubJub-ElGamal hybrid encryption
 > of the opening on the public board, a per-ballot cast proof (6,095
-> constraints, ~50 ms rapidsnark, verified publicly BEFORE tallying), a
-> HARD commitment opening inside the tally circuit, and a SOFT-SAFE
-> Schnorr gadget (complete Edwards double-and-add). Tally circuits grew
-> ~19-20%: small 116,035 -> 140,179 (naive 139,140), medium 1,009,483 ->
-> 1,202,635, validity chunk 1,017,911 -> ~1.21M. The tables below predate
-> this change; scale proving times by ~1.2x for current circuits (the
-> measured cast-proof and updated headline numbers are in the "CAST-ZK
-> costs" section at the end).
+> constraints, 136 ms snarkjs prove incl. witness gen, verified publicly
+> BEFORE tallying), a HARD commitment opening inside the tally circuit,
+> and a SOFT-SAFE Schnorr gadget (complete Edwards double-and-add, soft
+> on-curve flags, and a soft S-canonicity flag matching the native
+> verifier's rule — see tests/soft_safety_tests.rs). Tally circuits grew
+> ~22-24% relative to the pre-CAST format: small 116,035 -> 144,339
+> (naive 143,300), medium 1,009,483 -> 1,235,915 (naive 1,234,980),
+> validity chunk 1,017,911 -> ~1.25M. **All tables below are re-measured
+> on the current circuits** with freshly generated zkeys; the per-ballot
+> Path-1 costs are in the "CAST-ZK per-ballot costs" section at the end.
 
 ## Environment
 
@@ -44,7 +46,7 @@ proving is claimed or benchmarked.**
 ## Commands run
 
 ```bash
-cargo test                                # 94 passed, 0 failed
+cargo test                                # 129 passed, 0 failed
 scripts/compile_circuits.sh small         # + small_naive, medium, medium_naive
 scripts/setup_groth16.sh small            # + small_naive, medium, medium_naive
 cargo bench --bench prover                # all groups below
@@ -53,7 +55,7 @@ scripts/install_rapidsnark.sh            # native prover (optional fast path)
 /usr/bin/time -l <prover> ...             # peak RSS (snarkjs and rapidsnark)
 ```
 
-Pass/fail: `cargo test` **94 passed / 0 failed** (includes Groth16
+Pass/fail: `cargo test` **129 passed / 0 failed** (includes Groth16
 integration tests: real prove+verify, tampered-public-input rejection,
 wrong-tally unprovability, cross-instance rejection, no witness data in the
 proof; plus the new hard-indexed-row and state-separation tests). All four
@@ -79,10 +81,11 @@ Constraint counts (circom 2.1.9 → `snarkjs r1cs info`):
 
 | circuit | duplicate strategy | constraints | public inputs |
 |---|---|---|---|
-| `filter_and_tally_small` | B (sorted network) | 116,035 | 11 |
-| `filter_and_tally_small_naive` | A (naive O(B²)) | 114,996 | 11 |
-| `filter_and_tally_medium` | B (sorted network) | 1,009,483 | 11 |
-| `filter_and_tally_medium_naive` | A (naive O(B²)) | 1,008,548 | 11 |
+| `filter_and_tally_small` | B (sorted network) | 144,339 | 11 |
+| `filter_and_tally_small_naive` | A (naive O(B²)) | 143,300 | 11 |
+| `filter_and_tally_medium` | B (sorted network) | 1,235,915 | 11 |
+| `filter_and_tally_medium_naive` | A (naive O(B²)) | 1,234,980 | 11 |
+| `filter_and_tally_cast` (per-ballot pi_cast) | — | 6,095 | 15 |
 
 At 16 slots the Batcher network (63 comparators) costs ~1k constraints more
 than the naive scan (120 pairs); at 128 slots (1,471 comparators vs 8,128
@@ -95,31 +98,33 @@ constraint-equivalents of pair checks vs ~0.6 M for the network.
 
 | stage | small (16 slots) | medium (128 slots) |
 |---|---|---|
-| `setup_election` | 156 µs | 153 µs |
-| `preprocess_voter` (threshold-private, per voter) | 268 µs | 285 µs |
-| `finalize_registration` (indexed Merkle root) | 420 µs | 1.77 ms |
-| `cast_vote` | 522 µs | 549 µs |
-| `fake_compliance_ballot` | 512 µs | 552 µs |
-| `chaff_ballot` | 643 µs | 615 µs |
-| `anonymous_channel_flush` (shuffle, full board) | 2.2 µs | 16.7 µs |
-| `filter_and_tally_native` (exact tally) | 13.6 ms | 106 ms |
-| `build_tally_statement` | 518 µs | 3.7 ms |
-| `build_tally_witness` | 20.1 ms | 159 ms |
-| `relation_check_native` (mock backend, incl. sort network) | 14.0 ms | 122 ms |
-| `generate_witness_input` (input.json) | 137 µs | 1.21 ms |
+| `setup_election` | 111 µs | 112 µs |
+| `preprocess_voter` (threshold-private, incl. vk validation) | 239 µs | 239 µs |
+| `finalize_registration` (indexed Merkle root) | 306 µs | 1.29 ms |
+| `cast_vote` (incl. seal: com + hybrid ct_open) | 822 µs | 832 µs |
+| `fake_compliance_ballot` | 837 µs | 840 µs |
+| `chaff_ballot` | 902 µs | 914 µs |
+| `anonymous_channel_flush` (shuffle, full board) | 1.4 µs | 10.4 µs |
+| `filter_and_tally_native` (exact tally over BB_adm) | 8.9 ms | 73.6 ms |
+| `build_tally_statement` | 377 µs | 2.71 ms |
+| `build_tally_witness` | 11.9 ms | 96.3 ms |
+| `relation_check_native` (mock backend, incl. sort network) | 9.9 ms | 85.6 ms |
+| `generate_witness_input` (input.json) | 98 µs | 852 µs |
 
 Native tally/witness cost is dominated by per-ballot Schnorr verification
 and the per-ballot authorized share reconstruction of `R_EA,i` (Lagrange
 over t=2 shares, recomputed per ballot rather than cached —
-research-prototype simplicity).
+research-prototype simplicity). Ballot creation now includes the CAST-ZK
+seal (Poseidon commitment + BabyJubJub-ElGamal hybrid encryption of the
+opening), which is why `cast_vote` grew from ~0.55 ms to ~0.83 ms.
 
 ## Duplicate handling: Strategy A vs Strategy B (native, criterion)
 
 | records | A: naive O(B²) | B: sort + linear scan | B/A |
 |---|---|---|---|
-| 16 | 52 ns | 104 ns | 2.0× slower |
-| 128 | 2.11 µs | 1.15 µs | 1.8× faster |
-| 1024 | 157 µs | 12.6 µs | 12.5× faster |
+| 16 | 51 ns | 108 ns | 2.1× slower |
+| 128 | 2.09 µs | 1.15 µs | 1.8× faster |
+| 1024 | 144 µs | 12.6 µs | 11.5× faster |
 
 Both strategies agree on all inputs (fixed and randomized tests). Strategy B
 is the main strategy: it is what the circuit implements, and natively it
@@ -129,9 +134,9 @@ includes the explicit multiset-equality (permutation) check.
 
 | stage | small B | small A | medium B | medium A |
 |---|---|---|---|---|
-| circuit witness generation (wasm) | 0.64 s | 0.65 s | 4.09 s | 4.12 s |
-| Groth16 prove — snarkjs (incl. witness gen) | 4.17 s | 4.19 s | 30.8 s | 30.6 s |
-| **Groth16 prove — rapidsnark (prove step only)** | **0.25 s** | 0.25 s | **2.18 s** | 2.19 s |
+| circuit witness generation (wasm) | 0.75 s | 0.75 s | 5.11 s | 5.13 s |
+| Groth16 prove — snarkjs (incl. witness gen) | 5.58 s | 5.58 s | 42.1 s | 42.0 s |
+| **Groth16 prove — rapidsnark (prove step only)** | **0.38 s** | 0.37 s | **3.11 s** | 3.09 s |
 | Groth16 verify (snarkjs) | 0.21 s | 0.21 s | 0.21 s | 0.21 s |
 
 ### snarkjs vs rapidsnark (same .zkey, same .wtns, same verification key)
@@ -140,21 +145,22 @@ The rapidsnark rows measure the PROVE STEP alone from a pre-generated
 witness; the snarkjs `prove` rows include wasm witness generation (that is
 what `SnarkjsBackend::prove` does). Comparing like with like:
 
-| | small (116k) | medium (1.01M) |
+| | small (144k) | medium (1.24M) |
 |---|---|---|
-| prove step, snarkjs (est. = prove − witgen) | ~3.5 s | ~26.7 s |
-| prove step, rapidsnark | 0.25 s | 2.18 s |
-| **prove-step speedup** | **~14×** | **~12×** |
-| end-to-end witgen+prove, snarkjs | 4.17 s | 30.8 s |
-| end-to-end witgen+prove, rapidsnark path | 0.89 s | 6.28 s |
-| prove peak RSS, snarkjs | 2.70 GB | 7.62 GB |
-| prove peak RSS, rapidsnark | 0.15 GB | 1.13 GB |
+| prove step, snarkjs (est. = prove − witgen) | ~4.8 s | ~37.0 s |
+| prove step, rapidsnark | 0.38 s | 3.11 s |
+| **prove-step speedup** | **~13×** | **~12×** |
+| end-to-end witgen+prove, snarkjs | 5.58 s | 42.1 s |
+| end-to-end witgen+prove, rapidsnark path | 1.13 s | 8.22 s |
+| prove peak RSS, snarkjs | — | 9.26 GB |
+| prove peak RSS, rapidsnark | — | 1.56 GB |
+| witness generation peak RSS (wasm) | — | 0.47 GB |
 
 rapidsnark proofs verify under the unchanged snarkjs verification keys and
 bind public inputs identical to the snarkjs prover's (integration-tested:
 `groth16_integration_tests::rapidsnark_proves_and_snarkjs_verifies`). With
 the native prover, the wasm witness calculator becomes the pipeline
-bottleneck (0.64 s / 4.1 s) — circom's C++ witness generator would be the
+bottleneck (0.75 s / 5.2 s) — circom's C++ witness generator would be the
 next lever.
 
 Proof/statement sizes (independent of board size): `proof.json` ≈ **0.8 KB**
@@ -162,61 +168,131 @@ Proof/statement sizes (independent of board size): `proof.json` ≈ **0.8 KB**
 `public.json` ≈ **0.4 KB** (11 public inputs).
 
 Peak prover memory (`/usr/bin/time -l`, max resident set of the prove
-process):
+process, current circuits):
 
 | circuit | snarkjs prove | rapidsnark prove | witness gen (wasm) |
 |---|---|---|---|
-| small B (116k constraints) | 2.70 GB | 0.15 GB | — |
-| medium B (1.01M constraints) | 7.62 GB | 1.13 GB | 0.51 GB |
-| medium A (1.01M constraints) | 8.27 GB | — | — |
+| medium B (1,235,915 constraints) | 9.26 GB | 1.56 GB | 0.47 GB |
+| validity chunk (1,245,383; sampled during the N=10^4 run) | — | 1.55 GB | — |
 
 ## Chunked pipeline (implemented; boards beyond one circuit)
 
 The chunked route (CHUNKED_TALLY_DESIGN.md) is implemented end-to-end:
-K x ValidityChunk (1,017,911 constraints, C = 128 slots) + K x
-SortedRunChunk (92,235) + 1 x TallySum (~2.4k), with blinded record/run
+K x ValidityChunk (~1.25M constraints, C = 128 slots) + K x
+SortedRunChunk (95,378) + 1 x TallySum (48,000 at K=160), with blinded record/run
 commitments, a Fiat-Shamir grand-product permutation argument (both sides
-committed BEFORE the challenge), hiding boundary-record and partial-tally
-commitments, and native aggregate verification. Tests cover acceptance,
-tally agreement with the monolithic relation, and rejection of tampered
-sorted records / shifted partial tallies / forged challenges /
-invalidated records.
+committed BEFORE the challenge; the running products cross chunk
+boundaries ONLY as hiding commitments, and the final equality is proven
+inside the tally-sum circuit — no product value or per-chunk ratio is
+public), hiding boundary-record and partial-tally commitments, and a
+PUBLIC transcript verifier (`verify_chunked_public_transcript`: statement
++ admitted board + transcript + proof objects only). Tests cover
+acceptance, tally agreement with the monolithic relation, rejection of
+tampered sorted records / shifted partial tallies / forged challenges /
+invalidated records, and malicious public transcripts (swapped chunks,
+broken board/boundary/product chains, dropped admitted commitments,
+cross-chunk duplicates counted once).
 
-Measured (rapidsnark prove, wasm witness gen, criterion sample 10):
+Measured (rapidsnark prove, wasm witness gen, criterion sample 10;
+`prove_chunked` for the e2e rows, jobs=2):
 
 | stage | time |
 |---|---|
-| validity chunk: witness gen / prove | 3.99 s / 2.23 s |
-| sorted-run chunk: witness gen / prove | 0.21 s / 0.27 s |
+| validity chunk: witness gen / prove | 5.13 s / 3.19 s |
+| sorted-run chunk: witness gen / prove | 0.20 s / 0.26 s |
 | tally-sum proof | negligible |
-| **e2e 500 ballots (K=4, 9 proofs, sequential)** | **27.2 s** (verify-all 1.9 s) |
-| **e2e 1,000 ballots (K=8, 17 proofs, sequential)** | **55.4 s** (verify-all 3.5 s) |
+| e2e 500 ballots (K=4, 9 proofs) | 22.0 s (verify-all 1.9 s) |
+| e2e 1,000 ballots (K=8, 17 proofs) | 43.0 s (verify-all 3.5 s) |
 
-Per-chunk composite ~6.9 s, dominated by wasm witness generation; peak
-memory bounded by the ~1.1 GB validity chunk regardless of board size.
-Composed projection at B = 2N (measured per-chunk cost x K; SnarkPack
-figures cited for the optional O(log n) aggregate):
+## Measured scalability result (N = 10^4)
+
+**The headline result of this report**: a full 20,480-ballot chunked
+tally — the board size of an N = 10^4-voter election with B = 2N slots —
+proven and verified end-to-end on one laptop.
+
+### Reproducibility record
+
+| | |
+|---|---|
+| Commit | `593b428` ("Dispute verdicts: add NoAuthorityFault + external verdict coarsening"; the benchmarked tree — this file's numbers were added in the follow-up docs commit) |
+| Hardware | Apple M3 Max, 14 cores, 36 GB RAM |
+| OS | macOS 14.3 (Darwin 23.3.0) |
+| Toolchain | rustc 1.96.1; Node.js v26.4.0; circom 2.1.9; snarkjs 0.7.6; rapidsnark master (built via `scripts/install_rapidsnark.sh`) |
+| Trusted setup | public Hermez `powersOfTau28_hez_final_21.ptau` + dev-only local phase-2 (timings valid; keys NOT for production) |
+
+Commands:
+
+```bash
+scripts/compile_circuits.sh vchunk128   # + srun128, tsum160
+scripts/setup_groth16.sh   vchunk128    # + srun128, tsum160
+cargo run --release --bin prove_chunked -- --ballots 20480   # jobs = cores/6 = 2
+```
+
+Instance (synthetic, deterministic from `--seed 5000`; ADMISSION-PATH
+INDEPENDENT — `prove_chunked` models an already-admitted board, exactly
+what Path 1's public Clean or Path 2's EA admission produce; Path-1
+per-voter costs are the `cast` group below):
+
+| parameter | value |
+|---|---|
+| board slots B | 20,480 (24-bit positions: POS_BITS = 24, boards to 2^24) |
+| registered voters in the instance | 64 (see the parameter caveat below) |
+| candidates | 3 |
+| real / fake-compliance / chaff ballots | 64 / 5 / 20,411 |
+| chunk size C / chunks K / proofs 2K+1 | 128 / 160 / 321 |
+| ID_BITS / POS_BITS / MERKLE_DEPTH | 8 / 24 / 6 |
+| circuits (constraints) | vchunk128: 1,245,383; srun128: 95,378; tsum160: 48,000 |
+
+Measured results:
+
+| stage | measured |
+|---|---|
+| instance generation (native) | 18.4 s |
+| witness rows + records + commitments (native) | 57.5 s |
+| prove, 321 proofs (rapidsnark, jobs=2) | **847.5 s wall** (5.30 s/chunk-pair amortized) |
+| verify all 321 proofs (per-proof snarkjs CLI) | **67.1 s** (~3 ms/proof in-process pairing) |
+| peak memory per prover worker | 1.55 GB |
+| proof / public size (per proof) | 805 B / ≤449 B |
+
+### Parameter caveat and the widened-parameter projection factor
+
+The compiled chunk circuits index a DEPTH-6 registration tree (<= 64
+voters, 8-bit ids): the measured run exercises the true 10^4-scale BOARD
+(the cost driver — K = B/128 chunk proofs) with 64 distinct registered
+voters. A real 10^4-voter electorate needs a depth-14 tree and 14-bit
+ids. We compiled that variant to size it exactly:
+`filter_and_tally_vchunk128_d14` = **1,493,181 constraints** = 1.199x the
+depth-6 chunk (the id-width change adds only ~6 bits per sort-key
+comparator, negligible). All projections below therefore apply a
+**x1.2 factor**; the measured 10^4 row itself would be ~17 min instead of
+~14 min on the widened circuits.
+
+### Measured 10^4 vs projected 10^5 / 10^6
+
+Projections = measured per-chunk cost x K x 1.2 (widened params), same
+jobs scaling; they assume chunk independence (measured: chunks share no
+witness data) and linear aggregation checks (sub-second even at K=2^14).
 
 | | N = 10^4 | N = 10^5 | N = 10^6 |
 |---|---|---|---|
+| board slots B = 2N | 20,480 | 204,800 | 2,048,000 |
 | chunks K / proofs 2K+1 | 160 / 321 | 1,600 / 3,201 | 16,000 / 32,001 |
-| prove, this M3 Max (jobs=2) | **10.8 min MEASURED** | ~1.8 h (proj.) | ~18 h (proj.) |
-| prove, 90-vCPU cloud box (jobs~15) | ~1.5-2 min (proj.) | ~15-20 min (proj.) | ~2.5-3 h (proj.) |
-| verify all proofs | **67.5 s MEASURED** (per-proof CLI) | ~11 min CLI / ~10 s in-process | ~96 s in-process |
+| prove, this M3 Max (jobs=2) | **14.1 min MEASURED** | ~2.8 h (proj., widened) | ~28 h (proj., widened) |
+| prove, 90-vCPU cloud box (jobs~15) | ~2.5 min (proj.) | ~25 min (proj.) | ~4 h (proj.) |
+| verify all proofs (in-process, ~3 ms each) | ~1 s | ~10 s | ~96 s |
+| peak memory per worker | **1.55 GB MEASURED** | ~1.9 GB (widened) | ~1.9 GB (widened) |
 
-The N = 10^4 row is now MEASURED end-to-end on the laptop via
-`cargo run --release --bin prove_chunked -- --ballots 20480` (24-bit board
-positions; 645.8 s prove wall at 2 concurrent rapidsnark jobs = 4.04 s
-per chunk-pair amortized; instance generation + witness/commitments add
-~70 s). GCP_RUNBOOK.md gives the one-command cloud recipe for the faster
-run; the 10^5/10^6 columns remain projections from the same measured
-per-chunk cost.
+The N = 10^4 column is MEASURED end-to-end (this section); N = 10^5 and
+N = 10^6 are PROJECTIONS, and they use the widened ID/POS/Merkle
+parameters (the x1.2 factor from the compiled depth-14 circuit), not the
+depth-6 circuits of the measured run. GCP_RUNBOOK.md gives the
+one-command cloud recipe.
 
 ## Reading the numbers
 
 * **Proving scales with circuit size, not board occupancy** — small→medium
-  is 8.7× the constraints and ~7–9× the prove time on both provers
-  (snarkjs 4.17 s → 30.8 s; rapidsnark 0.25 s → 2.18 s). One proof covers
+  is 8.6× the constraints and ~8× the prove time on both provers
+  (snarkjs 5.6 s → 42.1 s; rapidsnark 0.38 s → 3.11 s). One proof covers
   the whole board: the cost is per-tally, not per-ballot.
 * **Verification is flat** (~0.21 s at both sizes) and dominated by
   node/snarkjs process startup, not the pairing check.
@@ -229,10 +305,27 @@ per-chunk cost.
   authority does outside snarkjs — exact tally, witness build, native
   relation check — totals ~0.4 s even at 128 slots.
 * **The native prover changes the scaling picture**: rapidsnark proves the
-  1M-constraint circuit in 2.2 s using 1.1 GB (vs ~27 s / 7.6 GB for the
-  snarkjs prove step). Extrapolating roughly linearly, a 1024-slot board
-  (~8M constraints with Strategy B) looks like ~20 s and ~9 GB with
-  rapidsnark — feasible on this machine, where snarkjs would already be
-  out of memory. Witness generation (wasm) then dominates the pipeline;
-  circom's C++ witness calculator is the next lever, orthogonal to the
-  relation design.
+  1.24M-constraint circuit in 3.1 s using 1.56 GB (vs ~37 s / 9.26 GB for
+  the snarkjs prove step, both measured). Extrapolating roughly linearly,
+  a 1024-slot board (~10M constraints with Strategy B) looks like ~26 s
+  and ~13 GB with rapidsnark — feasible on this machine, where snarkjs
+  would already be out of memory. Witness generation (wasm) then dominates
+  the pipeline; circom's C++ witness calculator is the next lever,
+  orthogonal to the relation design.
+
+## CAST-ZK per-ballot costs (Path 1, measured)
+
+The `cast` criterion group measures the Path-1 per-voter/per-entry costs
+on the real 6,095-constraint cast circuit (fresh zkey, snarkjs backend):
+
+| stage | who pays | time |
+|---|---|---|
+| `seal_ballot` (com + hybrid ct_open) | voter | 0.62 ms |
+| `prove_cast` (pi_cast, incl. wasm witness gen) | voter | 135 ms |
+| `verify_cast_entry` (publics binding + Groth16 verify + C1 subgroup check) | anyone (Clean, per entry) | 208 ms |
+
+Verification time is dominated by node/snarkjs process startup (~0.2 s
+flat, same as the tally verifies above), not the pairing check; a
+long-running verifier process would amortize this away for bulk cleaning.
+Path 2 has no per-voter ZK cost: admission is one commitment opening check
+plus one BabyJubJub Schnorr receipt signature (<1 ms).

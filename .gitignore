@@ -14,3 +14,4 @@ regen_zkeys.log
 bench_full.log
 prove_chunked_10k.log
 regen_srun_tsum.log
+campaign.log

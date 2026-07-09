@@ -1,13 +1,48 @@
 # HANDOFF — admission-paths work, status of chunks A–E
 
+## UPDATE (2026-07-09, post-checkpoint)
+
+All caveats below are RESOLVED, and a second wave of work landed after
+the `d137a71` checkpoint:
+
+* **Soft-safe tally totality** (`7eb60c8`): in-circuit S-canonicity flag
+  (fixes a real voter-triggered unsat/DoS via S+l signature malleation),
+  registration-time vk validation, `tests/soft_safety_tests.rs` (7 DoS
+  tests incl. a real-Groth16 poisoned-board proof).
+* **Public chunked-transcript verifier + leakage fix** (`7d512bb`):
+  `verify_chunked_public_transcript` (public data + proof objects only;
+  13 malicious-transcript tests); the per-chunk public products pp_k/qq_k
+  (whose ratio leaked record information) are replaced by HIDING
+  running-product commitment chains with in-circuit final equality —
+  see CHUNKED_TALLY_DESIGN.md "Public values and leakage".
+* **Dispute verdicts** (`593b428`): `NoAuthorityFault` added +
+  `external_verdict()` coarsening (VoterFaulty -> NoAuthorityFault
+  externally), matching the paper's five-verdict model.
+* **Measured N=10^4 scalability result**: 20,480 ballots, 321 proofs,
+  847.5 s prove / 67.1 s verify-all on the finalized circuits
+  (BENCHMARKS.md "Measured scalability result"; commit `593b428`), with
+  a compiled depth-14 sizing variant (1,493,181 constraints) for honest
+  widened-parameter projections at 10^5/10^6.
+* All Groth16 zkeys regenerated for the final circuits (small 144,339;
+  medium 1,235,915; vchunk128 1,245,383; srun128 95,378; tsum
+  1,668–48,000). Full suite: **129 passed / 0 failed**. Benchmark tables
+  in BENCHMARKS.md and the paper's evaluation re-measured on these
+  circuits; the two previously-estimated cast numbers are now measured
+  (seal 0.62 ms, prove_cast 135 ms, verify 208 ms).
+
+The original checkpoint snapshot follows (historical).
+
+---
+
 Snapshot taken at commit `5561f0f` ("CAST-ZK ballot format + admitted-board
 submission model"). Working tree clean; `cargo check` passes; full test
 suite **109 passed / 0 failed** (includes real Groth16 prove+verify for
 the small tally circuits and the cast circuit). Chunks F–J not started.
 
-Toolchain note: one background process may still be regenerating the
-LARGE Groth16 zkeys (medium, medium_naive, vchunk128) under
-`build/` (untracked). Nothing in `cargo test` depends on them; only the
+Toolchain note (historical): one background process may still be
+regenerating the LARGE Groth16 zkeys (medium, medium_naive, vchunk128)
+under `build/` (untracked) — since completed, see the UPDATE above.
+Nothing in `cargo test` depends on them; only the
 `groth16_medium`/`chunked` benchmark groups do.
 
 ---
