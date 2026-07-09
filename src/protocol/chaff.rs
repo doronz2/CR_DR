@@ -7,7 +7,6 @@
 use ark_ff::UniformRand;
 use rand::{CryptoRng, Rng, RngCore};
 
-use crate::crypto::encryption::{commit_encrypt, opening_to_payload};
 use crate::crypto::hash::sig_msg_hash;
 use crate::crypto::signature::{keygen, sign};
 use crate::errors::Result;
@@ -30,6 +29,5 @@ pub fn chaff_ballot<R: RngCore + CryptoRng>(pp: &PublicParams, rng: &mut R) -> R
 
     let plaintext =
         BallotPlaintext { eid_hash: pp.eid_hash, id, vk, candidate, r, sigma };
-    let (ciphertext, opening) = commit_encrypt(&plaintext.to_fields(), rng);
-    Ok(Ballot { ciphertext, ea_payload: opening_to_payload(&opening) })
+    crate::protocol::vote::seal_ballot(pp, &plaintext, rng)
 }

@@ -23,7 +23,9 @@
 
 use criterion::{criterion_group, criterion_main, Criterion};
 
-use cr_dr::protocol::bulletin_board::{AnonymousChannel, BulletinBoard};
+use cr_dr::protocol::admission::admitted_from_ballots;
+use cr_dr::protocol::admission::{AdmittedOpenings};
+use cr_dr::protocol::bulletin_board::{AdmittedBoard, AnonymousChannel, BulletinBoard};
 use cr_dr::protocol::chaff::chaff_ballot;
 use cr_dr::protocol::duplicates::{counted_flags_naive, counted_flags_sorted, BallotRecord};
 use cr_dr::protocol::fake_compliance::{build_fake_ballot, fake_compliance};
@@ -55,7 +57,8 @@ struct Instance {
     reg: RegistrationState,
     voters: Vec<VoterState>,
     ballots: Vec<Ballot>,
-    bb: BulletinBoard,
+    admitted: AdmittedBoard,
+    openings: AdmittedOpenings,
     tally: TallyResult,
     statement: TallyStatement,
     witness: TallyWitness,
@@ -101,33 +104,33 @@ fn build_instance(
     }
     let reg = finalize_registration(&pp, &records).unwrap();
 
-    let mut channel = AnonymousChannel::new();
-    // Coerced voters: fake ballot (coercer's candidate 2) + real vote (0).
+    // Ballots shuffled voter-side; the tally benches model an ALREADY
+    // ADMITTED board (BB_adm + EA openings) — admission-path costs are
+    // benchmarked separately in the `cast` group (Path 1 per-voter).
+    let _ = AnonymousChannel::new;
+    let _ = BulletinBoard::new;
+    let mut ballots: Vec<Ballot> = Vec::new();
     for v in voters.iter().take(n_fake) {
         let t = fake_compliance(&pp, v, 2, &mut rng).unwrap();
-        channel.submit(build_fake_ballot(&pp, &t, &mut rng).unwrap());
-        channel.submit(cast_vote(&pp, &reg, v, 0, &mut rng).unwrap());
+        ballots.push(build_fake_ballot(&pp, &t, &mut rng).unwrap());
+        ballots.push(cast_vote(&pp, &reg, v, 0, &mut rng).unwrap());
     }
-    // Honest voters: one real vote each, alternating candidates 1/2.
     for (i, v) in voters.iter().enumerate().skip(n_fake) {
-        channel.submit(cast_vote(&pp, &reg, v, 1 + (i as u64 % 2), &mut rng).unwrap());
+        ballots.push(cast_vote(&pp, &reg, v, 1 + (i as u64 % 2), &mut rng).unwrap());
     }
     let n_real = voters.len();
     let n_chaff = shape.num_ballots - n_real - n_fake;
     for _ in 0..n_chaff {
-        channel.submit(chaff_ballot(&pp, &mut rng).unwrap());
+        ballots.push(chaff_ballot(&pp, &mut rng).unwrap());
     }
+    use rand::seq::SliceRandom;
+    ballots.shuffle(&mut rng);
 
-    let mut bb = BulletinBoard::new();
-    let mut ballots = Vec::new();
-    for b in channel.flush_shuffled(&mut rng) {
-        bb.append(b.public());
-        ballots.push(b);
-    }
-
-    let (tally, _) = filter_and_tally(&pp, &authority, &reg, &ballots).unwrap();
-    let statement = build_tally_statement(&pp, &bb, &reg, &tally);
-    let witness = build_tally_witness(&pp, &authority, &reg, &ballots).unwrap();
+    let (admitted, openings) = admitted_from_ballots(&ballots);
+    let (tally, _) = filter_and_tally(&pp, &authority, &reg, &admitted, &openings).unwrap();
+    let statement = build_tally_statement(&pp, &admitted, &reg, &tally);
+    let witness =
+        build_tally_witness(&pp, &authority, &reg, &admitted, &openings).unwrap();
     assert!(relation_check_native(&statement, &witness, &shape));
     let input = generate_witness_input(&statement, &witness, &shape).unwrap();
 
@@ -139,7 +142,8 @@ fn build_instance(
         reg,
         voters,
         ballots,
-        bb,
+        admitted,
+        openings,
         tally,
         statement,
         witness,
@@ -236,10 +240,10 @@ fn bench_e2e(c: &mut Criterion, mut inst: Instance, group_name: &str) {
         b.iter(|| chaff_ballot(&pp, &mut rng).unwrap())
     });
     g.bench_function("anonymous_channel_flush", |b| {
-        let ballots = inst.ballots.clone();
+        let entries: Vec<_> = inst.ballots.iter().map(|x| x.public()).collect();
         b.iter(|| {
             let mut ch = AnonymousChannel::new();
-            for x in &ballots {
+            for x in &entries {
                 ch.submit(x.clone());
             }
             ch.flush_shuffled(&mut inst.rng)
@@ -247,15 +251,17 @@ fn bench_e2e(c: &mut Criterion, mut inst: Instance, group_name: &str) {
     });
     g.bench_function("filter_and_tally_native", |b| {
         b.iter(|| {
-            filter_and_tally(&inst.pp, &inst.authority, &inst.reg, &inst.ballots).unwrap()
+            filter_and_tally(&inst.pp, &inst.authority, &inst.reg, &inst.admitted, &inst.openings)
+                .unwrap()
         })
     });
     g.bench_function("build_tally_statement", |b| {
-        b.iter(|| build_tally_statement(&inst.pp, &inst.bb, &inst.reg, &inst.tally))
+        b.iter(|| build_tally_statement(&inst.pp, &inst.admitted, &inst.reg, &inst.tally))
     });
     g.bench_function("build_tally_witness", |b| {
         b.iter(|| {
-            build_tally_witness(&inst.pp, &inst.authority, &inst.reg, &inst.ballots).unwrap()
+            build_tally_witness(&inst.pp, &inst.authority, &inst.reg, &inst.admitted, &inst.openings)
+                .unwrap()
         })
     });
     g.bench_function("relation_check_native", |b| {
@@ -395,6 +401,52 @@ fn bench_groth16_medium(c: &mut Criterion) {
     bench_groth16(c, &inst, "groth16_medium", "medium");
 }
 
+
+// ---------------------------------------------------------------------------
+// Path-1 admission: per-voter cast-ZK costs (seal, prove, verify, Clean)
+// ---------------------------------------------------------------------------
+
+fn bench_cast(c: &mut Criterion) {
+    use cr_dr::zk::cast::*;
+    let root = SnarkjsBackend::crate_root();
+    let be = SnarkjsBackend { root: root.clone(), circuit: CAST_CIRCUIT.into() };
+    if !be.toolchain_available() {
+        eprintln!("SKIP cast: cast circuit artifacts not found");
+        return;
+    }
+    let mut rng = ChaCha20Rng::seed_from_u64(9000);
+    let cfg = config(&SMALL_SHAPE, 6, "bench-cast");
+    let (pp, mut authority) = setup_election(cfg, &mut rng).unwrap();
+    let mut records = Vec::new();
+    let mut voters = Vec::new();
+    for id in 0..6u64 {
+        let (vs, rec) = preprocess_voter(&pp, &mut authority, id, &mut rng).unwrap();
+        voters.push(vs);
+        records.push(rec);
+    }
+    let reg = finalize_registration(&pp, &records).unwrap();
+    let ballot = cast_vote(&pp, &reg, &voters[0], 1, &mut rng).unwrap();
+    let proof = prove_cast(&root, &pp.pk_ea, &ballot.public(), &ballot.secret).unwrap();
+    assert!(verify_cast_entry(&root, &pp.pk_ea, &ballot.public(), &proof).unwrap());
+
+    let mut g = c.benchmark_group("cast");
+    g.sample_size(10);
+    g.bench_function("seal_ballot", |b| {
+        let pt = cr_dr::types::BallotPlaintext::from_fields(
+            &ballot.secret.opening.plaintext_fields,
+        )
+        .unwrap();
+        b.iter(|| cr_dr::protocol::vote::seal_ballot(&pp, &pt, &mut rng).unwrap())
+    });
+    g.bench_function("prove_cast", |b| {
+        b.iter(|| prove_cast(&root, &pp.pk_ea, &ballot.public(), &ballot.secret).unwrap())
+    });
+    g.bench_function("verify_cast_entry", |b| {
+        b.iter(|| assert!(verify_cast_entry(&root, &pp.pk_ea, &ballot.public(), &proof).unwrap()))
+    });
+    g.finish();
+}
+
 criterion_group!(
     benches,
     bench_e2e_small,
@@ -402,7 +454,8 @@ criterion_group!(
     bench_duplicates,
     bench_groth16_small,
     bench_groth16_medium,
-    bench_chunked
+    bench_chunked,
+    bench_cast
 );
 criterion_main!(benches);
 
@@ -430,25 +483,24 @@ fn build_chunked_instance(seed: u64, n_ballots: usize) -> cr_dr::zk::chunked::Ch
         records.push(rec);
     }
     let reg = finalize_registration(&pp, &records).unwrap();
-    let mut channel = AnonymousChannel::new();
+    let mut ballots: Vec<Ballot> = Vec::new();
     for v in voters.iter().take(5) {
         let t = fake_compliance(&pp, v, 2, &mut rng).unwrap();
-        channel.submit(build_fake_ballot(&pp, &t, &mut rng).unwrap());
-        channel.submit(cast_vote(&pp, &reg, v, 0, &mut rng).unwrap());
+        ballots.push(build_fake_ballot(&pp, &t, &mut rng).unwrap());
+        ballots.push(cast_vote(&pp, &reg, v, 0, &mut rng).unwrap());
     }
     for (i, v) in voters.iter().enumerate().skip(5) {
-        channel.submit(cast_vote(&pp, &reg, v, 1 + (i as u64 % 2), &mut rng).unwrap());
+        ballots.push(cast_vote(&pp, &reg, v, 1 + (i as u64 % 2), &mut rng).unwrap());
     }
     for _ in (5 + voters.len())..n_ballots {
-        channel.submit(chaff_ballot(&pp, &mut rng).unwrap());
+        ballots.push(chaff_ballot(&pp, &mut rng).unwrap());
     }
-    let mut bb = BulletinBoard::new();
-    let mut ballots = Vec::new();
-    for b in channel.flush_shuffled(&mut rng) {
-        bb.append(b.public());
-        ballots.push(b);
-    }
-    build_chunked_tally(&pp, &authority, &reg, &ballots, &bb, CHUNK_SIZE, &mut rng).unwrap()
+    // shuffled voter-side; the bench models an already-admitted board
+    use rand::seq::SliceRandom;
+    ballots.shuffle(&mut rng);
+    let (admitted, openings) = admitted_from_ballots(&ballots);
+    build_chunked_tally(&pp, &authority, &reg, &admitted, &openings, CHUNK_SIZE, &mut rng)
+        .unwrap()
 }
 
 fn bench_chunked(c: &mut Criterion) {

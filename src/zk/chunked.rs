@@ -31,9 +31,10 @@ use serde_json::{json, Value};
 
 use crate::crypto::poseidon_native::poseidon;
 use crate::errors::{CrDrError, Result};
-use crate::protocol::bulletin_board::BulletinBoard;
+use crate::protocol::admission::AdmittedOpenings;
+use crate::protocol::bulletin_board::AdmittedBoard;
 use crate::protocol::preprocessing::RegistrationState;
-use crate::types::{f_to_dec, AuthoritySecretState, Ballot, F, PublicParams};
+use crate::types::{f_to_dec, AuthoritySecretState, F, PublicParams};
 use crate::zk::mock_backend::{eval_row, Rec};
 use crate::zk::statement::{build_tally_statement, TallyStatement};
 use crate::zk::witness::{build_tally_witness, padding_row, BallotWitnessRow};
@@ -130,24 +131,30 @@ pub fn build_chunked_tally<R: RngCore + CryptoRng>(
     pp: &PublicParams,
     authority_secret: &AuthoritySecretState,
     registration_state: &RegistrationState,
-    ballots: &[Ballot],
-    bb_board: &BulletinBoard,
+    admitted: &AdmittedBoard,
+    openings: &AdmittedOpenings,
     chunk_size: usize,
     rng: &mut R,
 ) -> Result<ChunkedTally> {
     let c = chunk_size;
-    let k_chunks = ballots.len().div_ceil(c).max(1);
+    let k_chunks = admitted.len().div_ceil(c).max(1);
     let padded = k_chunks * c;
-    if ballots.len() > 1 << 24 {
+    if admitted.len() > 1 << 24 {
         return Err(CrDrError::ZkToolchain("board exceeds 2^24 slots".into()));
     }
 
-    let (tally, _) =
-        crate::protocol::filter_and_tally::filter_and_tally(pp, authority_secret, registration_state, ballots)?;
-    let statement = build_tally_statement(pp, bb_board, registration_state, &tally);
+    let (tally, _) = crate::protocol::filter_and_tally::filter_and_tally(
+        pp,
+        authority_secret,
+        registration_state,
+        admitted,
+        openings,
+    )?;
+    let statement = build_tally_statement(pp, admitted, registration_state, &tally);
 
     // Witness rows, padded to K*C.
-    let witness = build_tally_witness(pp, authority_secret, registration_state, ballots)?;
+    let witness =
+        build_tally_witness(pp, authority_secret, registration_state, admitted, openings)?;
     let mut rows = witness.rows;
     while rows.len() < padded {
         rows.push(padding_row(pp.merkle_depth));

@@ -8,15 +8,15 @@
 //! The judge NEVER forwards R_EA,i to the voter (a transferable R_EA,i would
 //! be a receipt), and its detailed report is judge-private.
 
-use crate::crypto::encryption::{commit_open, EncOpening};
-use crate::crypto::hash::sig_msg_hash;
+use crate::crypto::encryption::EncOpening;
+use crate::crypto::hash::{ct_commit, sig_msg_hash};
 use crate::crypto::shamir::Share;
 use crate::crypto::signature::verify;
 use crate::disputes::judge::{JudgeReport, Verdict};
-use crate::protocol::bulletin_board::BulletinBoard;
+use crate::protocol::bulletin_board::AdmittedBoard;
 use crate::protocol::filter_and_tally::{registration_check, RegistrationCheck};
 use crate::protocol::preprocessing::RegistrationState;
-use crate::types::{Ballot, BallotPlaintext, F, InternalBallotStatus, PublicParams};
+use crate::types::{BallotPlaintext, F, InternalBallotStatus, PublicParams, PLAINTEXT_FIELD_LEN};
 
 /// How the judge obtains R_EA,i.
 #[derive(Debug, Clone)]
@@ -27,10 +27,13 @@ pub enum NonceSource {
     ThresholdShares(Vec<Share>),
 }
 
-/// A voter's tallied-as-recorded complaint, delivered privately to the judge.
+/// A voter's tallied-as-recorded complaint, delivered privately to the
+/// judge: the admitted commitment plus the voter's claimed opening
+/// (opening fields + r_com), which the judge checks against `com`.
+/// ADMISSION-PATH INDEPENDENT: only the commitment matters.
 #[derive(Debug, Clone)]
 pub struct TalliedAsRecordedComplaint {
-    pub ballot: Ballot,
+    pub com: crate::types::F,
     pub opening: EncOpening,
 }
 
@@ -63,33 +66,31 @@ pub struct AuthorityEvidence<'a> {
 pub fn judge_tallied_as_recorded(
     pp: &PublicParams,
     registration_state: &RegistrationState,
-    bb: &BulletinBoard,
+    admitted: &AdmittedBoard,
     complaint: &TalliedAsRecordedComplaint,
     evidence: &AuthorityEvidence<'_>,
 ) -> JudgeReport {
-    // (0) the complaint presumes the ballot is recorded.
-    let Some(board_index) = bb
-        .list_public_ballots()
-        .iter()
-        .position(|b| b.ciphertext == complaint.ballot.ciphertext)
-    else {
+    // (0) the complaint presumes the commitment was admitted.
+    let Some(board_index) = admitted.coms.iter().position(|c| *c == complaint.com) else {
         return JudgeReport::new(
             Verdict::Undetermined,
-            "ballot is not recorded on the board; file a recorded-as-cast dispute instead",
+            "commitment is not on the admitted board; file a recorded-as-cast dispute instead",
         );
     };
 
-    // (1) ballot opens/decrypts to the claimed plaintext.
-    let opened = match commit_open(&complaint.ballot.ciphertext, &complaint.ballot.ea_payload) {
-        Ok(o) => o,
-        Err(_) => {
-            return JudgeReport::new(Verdict::VoterFaulty, "ballot does not open correctly")
-        }
-    };
-    if opened != complaint.opening {
-        return JudgeReport::new(Verdict::VoterFaulty, "claimed opening does not match ballot");
+    // (1) the claimed opening opens the ballot commitment.
+    if complaint.opening.plaintext_fields.len() != PLAINTEXT_FIELD_LEN {
+        return JudgeReport::new(Verdict::VoterFaulty, "malformed opening");
     }
-    let pt = match BallotPlaintext::from_fields(&opened.plaintext_fields) {
+    let mut fields = [F::from(0u64); PLAINTEXT_FIELD_LEN];
+    fields.copy_from_slice(&complaint.opening.plaintext_fields);
+    if ct_commit(&fields, complaint.opening.rho) != complaint.com {
+        return JudgeReport::new(
+            Verdict::VoterFaulty,
+            "claimed opening does not open the ballot commitment",
+        );
+    }
+    let pt = match BallotPlaintext::from_fields(&complaint.opening.plaintext_fields) {
         Ok(p) => p,
         Err(_) => return JudgeReport::new(Verdict::VoterFaulty, "malformed plaintext"),
     };

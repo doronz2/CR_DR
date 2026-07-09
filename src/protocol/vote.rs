@@ -1,19 +1,48 @@
-//! Real-vote casting.
+//! Real-vote casting in the CAST-ZK format.
 
+use ark_ff::UniformRand;
 use rand::{CryptoRng, RngCore};
 
-use crate::crypto::encryption::{commit_encrypt, opening_to_payload};
-use crate::crypto::hash::sig_msg_hash;
+use crate::crypto::encryption::{cast_encrypt, sample_rho_enc, CastSecret, EncOpening, CAST_CT_LEN};
+use crate::crypto::hash::{ct_commit, sig_msg_hash};
 use crate::crypto::signature::sign;
 use crate::errors::{CrDrError, Result};
 use crate::protocol::preprocessing::RegistrationState;
-use crate::types::{Ballot, BallotPlaintext, Candidate, PublicParams, VoterState};
+use crate::types::{Ballot, BallotPlaintext, Candidate, F, PublicParams, VoterState};
+
+/// Seal a plaintext into the CAST-ZK ballot format:
+///     com     = H_ballot_com(opening, r_com)
+///     ct_open = Enc_pkEA(opening, r_com; rho_enc)
+/// The returned Ballot carries the CastSecret (for pi_cast generation via
+/// zk::cast and for disputes); only Ballot::public() goes on the board.
+pub fn seal_ballot<R: RngCore + CryptoRng>(
+    pp: &PublicParams,
+    plaintext: &BallotPlaintext,
+    rng: &mut R,
+) -> Result<Ballot> {
+    let fields = plaintext.to_fields();
+    let r_com = F::rand(rng);
+    let com = ct_commit(&fields, r_com);
+    let rho_enc = sample_rho_enc(rng);
+    let mut cast_fields = [F::from(0u64); CAST_CT_LEN];
+    cast_fields[..9].copy_from_slice(&fields);
+    cast_fields[9] = r_com;
+    let ct_open = cast_encrypt(&pp.pk_ea, &cast_fields, rho_enc)?;
+    Ok(Ballot {
+        com,
+        ct_open,
+        secret: CastSecret {
+            opening: EncOpening { plaintext_fields: fields.to_vec(), rho: r_com },
+            rho_enc,
+        },
+    })
+}
 
 /// Build a real ballot for `candidate`.
 ///
 /// sigma = Sign_sk_i(eid_hash, i, candidate, R_i); the plaintext
-/// (eid_hash, i, vk_i, candidate, R_i, sigma) is encrypted (commitment-mode
-/// backend) and the exact public bytes are fixed at this point.
+/// (eid_hash, i, vk_i, candidate, R_i, sigma) is sealed into the CAST-ZK
+/// format (commitment + encrypted opening; pi_cast attached separately).
 pub fn cast_vote<R: RngCore + CryptoRng>(
     pp: &PublicParams,
     registration_state: &RegistrationState,
@@ -41,6 +70,5 @@ pub fn cast_vote<R: RngCore + CryptoRng>(
         r: voter_state.r,
         sigma,
     };
-    let (ciphertext, opening) = commit_encrypt(&plaintext.to_fields(), rng);
-    Ok(Ballot { ciphertext, ea_payload: opening_to_payload(&opening) })
+    seal_ballot(pp, &plaintext, rng)
 }

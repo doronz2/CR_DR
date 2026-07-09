@@ -10,7 +10,6 @@
 use ark_ff::UniformRand;
 use rand::{CryptoRng, RngCore};
 
-use crate::crypto::encryption::{commit_encrypt, opening_to_payload};
 use crate::crypto::hash::sig_msg_hash;
 use crate::crypto::signature::{sign, SecretKey, Signature, VerificationKey};
 use crate::errors::{CrDrError, Result};
@@ -73,6 +72,5 @@ pub fn build_fake_ballot<R: RngCore + CryptoRng>(
         r: transcript.r_fake,
         sigma: transcript.sigma_fake,
     };
-    let (ciphertext, opening) = commit_encrypt(&plaintext.to_fields(), rng);
-    Ok(Ballot { ciphertext, ea_payload: opening_to_payload(&opening) })
+    crate::protocol::vote::seal_ballot(_pp, &plaintext, rng)
 }

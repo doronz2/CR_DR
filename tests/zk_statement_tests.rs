@@ -1,6 +1,7 @@
 mod common;
 
-use cr_dr::protocol::bulletin_board::{AnonymousChannel, BulletinBoard};
+use cr_dr::protocol::admission::{admitted_from_ballots, AdmittedOpenings};
+use cr_dr::protocol::bulletin_board::{AdmittedBoard, BulletinBoard};
 use cr_dr::protocol::chaff::chaff_ballot;
 use cr_dr::protocol::fake_compliance::{build_fake_ballot, fake_compliance};
 use cr_dr::protocol::filter_and_tally::filter_and_tally;
@@ -13,6 +14,8 @@ use cr_dr::zk::SMALL_SHAPE;
 struct Instance {
     env: common::Env,
     bb: BulletinBoard,
+    admitted: AdmittedBoard,
+    openings: AdmittedOpenings,
     ballots: Vec<cr_dr::types::Ballot>,
     tally: cr_dr::types::TallyResult,
     statement: cr_dr::zk::statement::TallyStatement,
@@ -21,29 +24,31 @@ struct Instance {
 
 fn build_instance(seed: u64) -> Instance {
     let mut env = common::small_election(seed);
-    let mut channel = AnonymousChannel::new();
+    let mut ballots = Vec::new();
     // coerced voter 0: fake for candidate 2, real for candidate 0
     let coerced = env.voters[0].clone();
     let t = fake_compliance(&env.pp, &coerced, 2, &mut env.rng).unwrap();
-    channel.submit(build_fake_ballot(&env.pp, &t, &mut env.rng).unwrap());
-    channel.submit(cast_vote(&env.pp, &env.reg, &coerced, 0, &mut env.rng).unwrap());
+    ballots.push(build_fake_ballot(&env.pp, &t, &mut env.rng).unwrap());
+    ballots.push(cast_vote(&env.pp, &env.reg, &coerced, 0, &mut env.rng).unwrap());
     for (i, cand) in [1u64, 1, 2].iter().enumerate() {
         let voter = env.voters[i + 1].clone();
-        channel.submit(cast_vote(&env.pp, &env.reg, &voter, *cand, &mut env.rng).unwrap());
+        ballots.push(cast_vote(&env.pp, &env.reg, &voter, *cand, &mut env.rng).unwrap());
     }
-    channel.submit(chaff_ballot(&env.pp, &mut env.rng).unwrap());
+    ballots.push(chaff_ballot(&env.pp, &mut env.rng).unwrap());
+    // shuffled voter-side; instance models an already-admitted board
+    use rand::seq::SliceRandom;
+    ballots.shuffle(&mut env.rng);
     let mut bb = BulletinBoard::new();
-    let mut ballots = Vec::new();
-    for b in channel.flush_shuffled(&mut env.rng) {
+    for b in &ballots {
         bb.append(b.public());
-        ballots.push(b);
     }
+    let (admitted, openings) = admitted_from_ballots(&ballots);
     let (tally, _) =
-        filter_and_tally(&env.pp, &env.authority, &env.reg, &ballots).unwrap();
-    let statement = build_tally_statement(&env.pp, &bb, &env.reg, &tally);
+        filter_and_tally(&env.pp, &env.authority, &env.reg, &admitted, &openings).unwrap();
+    let statement = build_tally_statement(&env.pp, &admitted, &env.reg, &tally);
     let witness =
-        build_tally_witness(&env.pp, &env.authority, &env.reg, &ballots).unwrap();
-    Instance { env, bb, ballots, tally, statement, witness }
+        build_tally_witness(&env.pp, &env.authority, &env.reg, &admitted, &openings).unwrap();
+    Instance { env, bb, admitted, openings, ballots, tally, statement, witness }
 }
 
 #[test]
@@ -97,7 +102,8 @@ fn witness_flags_match_native_evaluation() {
         &inst.env.pp,
         &inst.env.authority,
         &inst.env.reg,
-        &inst.ballots,
+        &inst.admitted,
+        &inst.openings,
     )
     .unwrap();
     let counted: u64 = inst.witness.rows.iter().filter(|r| r.expect_counted).count() as u64;
@@ -141,19 +147,19 @@ fn statement_binding_rejects_tampered_unconstrained_fields() {
     // native statement check against public data must catch tampering.
     use cr_dr::zk::statement::statement_matches_public_data;
     let inst = build_instance(76);
-    assert!(statement_matches_public_data(&inst.statement, &inst.env.pp, &inst.bb, &inst.env.reg));
+    assert!(statement_matches_public_data(&inst.statement, &inst.env.pp, &inst.admitted, &inst.env.reg));
 
     let mut bad = inst.statement.clone();
     bad.num_voters += 1;
-    assert!(!statement_matches_public_data(&bad, &inst.env.pp, &inst.bb, &inst.env.reg));
+    assert!(!statement_matches_public_data(&bad, &inst.env.pp, &inst.admitted, &inst.env.reg));
 
     let mut bad = inst.statement.clone();
     bad.pk_ea_commitment += cr_dr::types::F::from(1u64);
-    assert!(!statement_matches_public_data(&bad, &inst.env.pp, &inst.bb, &inst.env.reg));
+    assert!(!statement_matches_public_data(&bad, &inst.env.pp, &inst.admitted, &inst.env.reg));
 
     let mut bad = inst.statement.clone();
     bad.num_ballots += 1;
-    assert!(!statement_matches_public_data(&bad, &inst.env.pp, &inst.bb, &inst.env.reg));
+    assert!(!statement_matches_public_data(&bad, &inst.env.pp, &inst.admitted, &inst.env.reg));
 }
 
 #[test]
@@ -172,24 +178,15 @@ fn proof_public_inputs_are_bound_to_the_statement() {
 
 #[test]
 fn serialized_public_board_contains_no_openings() {
-    // Regression: the public board must expose ONLY ciphertexts — no
-    // ea_payload / plaintext openings (votes, ids, nonces, signatures).
+    // Regression: the public board must expose ONLY (com, ct_open) — no
+    // cast secrets, openings or blinding values. The comprehensive
+    // value-level leak test (opening fields, R, R_EA, candidate, validity,
+    // sorted records) lives in cast_tests.rs where the secrets are in
+    // scope.
     let inst = build_instance(78);
     let board_json = serde_json::to_string(&inst.bb).unwrap();
-    assert!(!board_json.contains("ea_payload"));
-    assert!(!board_json.contains("plaintext_fields"));
-    assert!(!board_json.contains("rho"));
-    // And none of the private opening values leak into the board encoding
-    // (skip short values like ids/candidates, which collide as substrings).
-    for b in &inst.ballots {
-        let payload = String::from_utf8(b.ea_payload.clone()).unwrap();
-        let opening: serde_json::Value = serde_json::from_str(&payload).unwrap();
-        for f in opening["plaintext_fields"].as_array().unwrap() {
-            let s = f.as_str().unwrap();
-            if s.len() > 8 {
-                assert!(!board_json.contains(s));
-            }
-        }
+    for key in ["secret", "opening", "plaintext_fields", "rho", "ea_payload"] {
+        assert!(!board_json.contains(key), "board leaks key {key}");
     }
 }
 

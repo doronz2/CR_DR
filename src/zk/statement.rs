@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::hash::{bb_commitment, candidate_set_commitment, pk_ea_commitment};
-use crate::protocol::bulletin_board::BulletinBoard;
+use crate::protocol::bulletin_board::AdmittedBoard;
 use crate::protocol::preprocessing::RegistrationState;
 use crate::types::{fserde, F, PublicParams, TallyResult};
 
@@ -33,15 +33,11 @@ pub struct TallyStatement {
 /// Build the public statement from public data only.
 pub fn build_tally_statement(
     pp: &PublicParams,
-    bb: &BulletinBoard,
+    admitted: &AdmittedBoard,
     registration_state: &RegistrationState,
     tally: &TallyResult,
 ) -> TallyStatement {
-    let ct_fields: Vec<Vec<F>> = bb
-        .list_public_ballots()
-        .iter()
-        .map(|b| b.ciphertext.fields.clone())
-        .collect();
+    let ct_fields: Vec<Vec<F>> = admitted.coms.iter().map(|c| vec![*c]).collect();
     TallyStatement {
         eid_hash: pp.eid_hash,
         pk_ea_commitment: pk_ea_commitment(&pp.pk_ea),
@@ -49,7 +45,7 @@ pub fn build_tally_statement(
         candidate_set_commitment: candidate_set_commitment(&pp.candidates),
         tally_counts: tally.counts.clone(),
         bb_commitment: bb_commitment(&ct_fields),
-        num_ballots: bb.len() as u64,
+        num_ballots: admitted.len() as u64,
         num_voters: registration_state.records.len() as u64,
         duplicate_rule_id: pp.duplicate_rule.id(),
     }
@@ -69,12 +65,12 @@ pub fn build_tally_statement(
 pub fn statement_matches_public_data(
     statement: &TallyStatement,
     pp: &PublicParams,
-    bb: &BulletinBoard,
+    admitted: &AdmittedBoard,
     registration_state: &RegistrationState,
 ) -> bool {
     let expected = build_tally_statement(
         pp,
-        bb,
+        admitted,
         registration_state,
         &TallyResult { counts: statement.tally_counts.clone(), counted_ballots: 0 },
     );

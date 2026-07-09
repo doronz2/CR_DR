@@ -14,31 +14,29 @@
 //!   through the share-based `r_ea()` interface, so a Tier-3 prover can
 //!   replace that call with an MPC opening without changing the relation.
 //!
-//! ## Row layout
+//! ## CAST-ZK format
 //!
-//! The witness rows mirror the circuit's per-ballot private inputs. The
-//! registration side is INDEXED: the ballot's claimed id determines the
-//! Merkle leaf index, so the row carries the public table row values
-//! (reg_vk, reg_h) and the sibling path AT INDEX id — the direction bits
-//! are the bits of id itself and are not part of the witness.
+//! Every board entry (com, ct_open) with a publicly verified pi_cast
+//! decrypts (sk_EA) to the exact opening committed in `com`; the tally
+//! circuit HARD-opens `com` with it. There is no dummy-substitution policy
+//! anymore: the circuit's downstream checks (incl. the Schnorr gadget) are
+//! soft-safe for ARBITRARY opening fields, so every decrypted opening is
+//! usable as-is. An undecryptable entry (impossible when pi_cast was
+//! verified) is a hard error.
 //!
-//! For ballots that cannot even be represented safely inside the circuit
-//! (unopenable ciphertexts, off-curve/identity points, non-canonical
-//! scalars), the builder substitutes a fixed "dummy" plaintext whose point
-//! coordinates are valid curve points. The circuit's hard constraints then
-//! remain satisfiable while the ballot's soft validity flag evaluates to 0 —
-//! the same verdict the native FilterAndTally reached.
+//! The registration side is INDEXED: the ballot's claimed id determines
+//! the Merkle leaf index, so the row carries the public table row values
+//! (reg_vk, reg_h) and the sibling path AT INDEX id.
 
 use ark_ff::Zero;
 
-use crate::crypto::encryption::commit_open;
 use crate::crypto::hash::ct_commit;
-use crate::crypto::signature::{base8_circom_coords, decode_point, f_is_canonical_scalar};
+use crate::crypto::signature::base8_circom_coords;
 use crate::errors::{CrDrError, Result};
 use crate::protocol::preprocessing::RegistrationState;
-use crate::types::{
-    AuthoritySecretState, Ballot, BallotPlaintext, F, PLAINTEXT_FIELD_LEN, PublicParams,
-};
+use crate::protocol::admission::AdmittedOpenings;
+use crate::protocol::bulletin_board::AdmittedBoard;
+use crate::types::{AuthoritySecretState, F, PLAINTEXT_FIELD_LEN, PublicParams};
 use crate::zk::CircuitShape;
 
 /// One per-ballot witness row (mirrors the circuit's private inputs).
@@ -107,21 +105,14 @@ pub fn padding_row(depth: usize) -> BallotWitnessRow {
     }
 }
 
-/// True iff the plaintext's curve points / scalars can be fed to the
-/// circuit's hard constraints (BabyCheck, Num2Bits, Edwards2Montgomery).
-fn circuit_safe(pt: &BallotPlaintext) -> bool {
-    let vk_ok = matches!(decode_point(pt.vk.x, pt.vk.y), Some(p) if !p.is_zero());
-    let r_ok = decode_point(pt.sigma.rx, pt.sigma.ry).is_some();
-    vk_ok && r_ok && f_is_canonical_scalar(&pt.sigma.s)
-}
-
 /// Build the witness for the posted ballots. Mirrors the native
 /// FilterAndTally decision procedure exactly.
 pub fn build_tally_witness(
     pp: &PublicParams,
     authority_secret: &AuthoritySecretState,
     registration_state: &RegistrationState,
-    ballots: &[Ballot],
+    admitted: &AdmittedBoard,
+    openings: &AdmittedOpenings,
 ) -> Result<TallyWitness> {
     let depth = pp.merkle_depth;
     let num_voters = registration_state.num_voters() as u64;
@@ -129,53 +120,25 @@ pub fn build_tally_witness(
         pp,
         authority_secret,
         registration_state,
-        ballots,
+        admitted,
+        openings,
     )?;
 
-    let mut rows = Vec::with_capacity(ballots.len());
-    for (ballot, eval) in ballots.iter().zip(&evals) {
-        if ballot.ciphertext.fields.len() != 1 {
-            return Err(CrDrError::Crypto("commitment-mode ciphertext expected".into()));
-        }
-        let ct = ballot.ciphertext.fields[0];
+    let mut rows = Vec::with_capacity(admitted.len());
+    for (j, eval) in evals.iter().enumerate() {
+        // The admitted commitment's opening (both admission paths
+        // guarantee it opens; checked defensively inside).
+        let (pt_fields, rho) =
+            crate::protocol::filter_and_tally::opening_checked(admitted, openings, j)?;
 
-        // Recover plaintext fields when the ballot opens and is circuit-safe;
-        // otherwise substitute the dummy row (opening check will fail softly).
-        let opened = commit_open(&ballot.ciphertext, &ballot.ea_payload)
-            .ok()
-            .and_then(|o| {
-                let mut f = [F::zero(); PLAINTEXT_FIELD_LEN];
-                f.copy_from_slice(&o.plaintext_fields);
-                Some((f, o.rho))
-            });
-
-        let (pt_fields, rho) = match opened {
-            Some((f, rho)) => {
-                match BallotPlaintext::from_fields(&f) {
-                    Ok(pt) if circuit_safe(&pt) => (f, rho),
-                    // id/candidate out of u64 range still fine for the
-                    // circuit as long as points are safe; from_fields
-                    // rejects those, so re-check point safety directly.
-                    _ => {
-                        if fields_points_safe(&f) {
-                            (f, rho)
-                        } else {
-                            (dummy_pt_fields(), F::zero())
-                        }
-                    }
-                }
-            }
-            None => (dummy_pt_fields(), F::zero()),
-        };
-
-        // Indexed registration side: the claimed id (real or dummy)
+        // Indexed registration side: the claimed id (whatever it is)
         // determines the row. For in-range ids the row values and sibling
         // path MUST be the true ones (hard constraints); out-of-range ids
         // get zeros (constraints gated off).
         let reg = registration_side(authority_secret, registration_state, &pt_fields, num_voters, depth);
 
         rows.push(BallotWitnessRow {
-            ct,
+            ct: admitted.coms[j],
             pt_fields,
             rho,
             r_ea: reg.r_ea,
@@ -193,13 +156,6 @@ pub fn build_tally_witness(
     }
 
     Ok(TallyWitness { rows, candidates: pp.candidates.clone() })
-}
-
-/// Point-safety check on raw fields (positions 2,3 = vk; 6,7 = sig R; 8 = s).
-fn fields_points_safe(f: &[F; PLAINTEXT_FIELD_LEN]) -> bool {
-    let vk_ok = matches!(decode_point(f[2], f[3]), Some(p) if !p.is_zero());
-    let r_ok = decode_point(f[6], f[7]).is_some();
-    vk_ok && r_ok && f_is_canonical_scalar(&f[8])
 }
 
 struct RegSide {

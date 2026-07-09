@@ -273,57 +273,55 @@ pub fn f_to_u64(f: &F) -> Option<u64> {
     }
 }
 
-/// A ballot as cast by the voter and carried by the anonymous channel.
+/// A ballot in the CAST-ZK format, as held by the VOTER. The public board
+/// entry is B_j = (com_j, ct_open_j, pi_cast_j):
 ///
-/// `ea_payload` models the ciphertext body that only the EA can open. In the
-/// commitment-mode prototype backend this is a serialized opening — the full
-/// plaintext, nonce and signature — so it must NEVER be published; only the
-/// EA (and, for a dispute, the private judge) may see it. See the loud
-/// warning in README and `crypto::encryption`.
+///   com_j     = H_ballot_com(opening_j, r_com_j)     (Poseidon commitment)
+///   ct_open_j = Enc_pkEA(opening_j, r_com_j; rho_enc_j)
+///   pi_cast_j = ZK proof binding com_j and ct_open_j to the same data
+///               (generated via zk::cast; verified PUBLICLY before tallying)
 ///
-/// Only the projection [`Ballot::public`] goes on the bulletin board. The
-/// exact public byte encoding is always derived from the ciphertext via
-/// [`Ballot::bytes`], never stored, so it cannot disagree with what is
-/// tallied.
+/// Only [`Ballot::public`] goes on the bulletin board; `secret` (the
+/// opening, r_com and rho_enc) stays with the voter for pi_cast generation
+/// and disputes. The exact public byte encoding is always derived from the
+/// public entry via [`Ballot::bytes`], never stored.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ballot {
-    pub ciphertext: crate::crypto::encryption::Ciphertext,
-    pub ea_payload: Vec<u8>,
+    #[serde(with = "fserde")]
+    pub com: F,
+    pub ct_open: crate::crypto::encryption::CastCiphertext,
+    pub secret: crate::crypto::encryption::CastSecret,
 }
 
 impl Ballot {
     /// The public part of the ballot: exactly what is posted on the board.
     pub fn public(&self) -> PublicBallot {
-        PublicBallot { ciphertext: self.ciphertext.clone() }
+        PublicBallot { com: self.com, ct_open: self.ct_open.clone() }
     }
 
-    /// Exact public byte encoding (derived from the ciphertext).
+    /// Exact public byte encoding (derived from the public entry).
     pub fn bytes(&self) -> Vec<u8> {
-        self.ciphertext.to_bytes()
+        self.public().bytes()
     }
 }
 
-/// The public part of a ballot: only the ciphertext. This is the ONLY
-/// per-ballot data that appears on the public bulletin board.
+/// The public part of a ballot: the commitment and the encrypted opening.
+/// This (plus pi_cast) is the ONLY per-ballot data on the public board;
+/// the EA reconstructs everything for tallying from it with sk_EA alone.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PublicBallot {
-    pub ciphertext: crate::crypto::encryption::Ciphertext,
+    #[serde(with = "fserde")]
+    pub com: F,
+    pub ct_open: crate::crypto::encryption::CastCiphertext,
 }
 
 impl PublicBallot {
-    /// Exact public byte encoding (derived from the ciphertext).
+    /// Exact public byte encoding: com || C1 || masked, 32-byte BE fields.
     pub fn bytes(&self) -> Vec<u8> {
-        self.ciphertext.to_bytes()
+        let mut out = f_to_bytes_be(&self.com).to_vec();
+        out.extend_from_slice(&self.ct_open.to_bytes());
+        out
     }
-}
-
-/// EA-PRIVATE store of the ballot payloads, aligned with bulletin-board
-/// order: `payloads[i]` belongs to board entry `i`. In commitment mode a
-/// payload is the full plaintext opening — publishing it would reveal votes,
-/// voter ids, nonces and signatures.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct AuthorityBallotPayloads {
-    pub payloads: Vec<Vec<u8>>,
 }
 
 /// Public tally output. This is the ONLY tally-related public output.
@@ -338,7 +336,6 @@ pub struct TallyResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InternalBallotStatus {
     Counted,
-    InvalidDecryption,
     InvalidFormat,
     InvalidCandidate,
     InvalidSignature,

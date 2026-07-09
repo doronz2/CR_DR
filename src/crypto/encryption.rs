@@ -1,35 +1,40 @@
-//! Ballot "encryption" backends.
+//! Ballot encryption: the CAST-ZK format.
 //!
-//! ============================================================
-//! LOUD WARNING — COMMITMENT-MODE PROTOTYPE, NOT FULL ENCRYPTION
-//! ============================================================
+//! A public board entry is B_j = (com_j, ct_open_j, pi_cast_j):
 //!
-//! The default backend used end-to-end (and matched by the circuit's
-//! `encryption_decrypt.circom`) is COMMITMENT MODE:
-//! `ciphertext = Poseidon(plaintext_fields || rho)`.
+//! ```text
+//! com_j     = H_ballot_com(opening_j, r_com_j)          (Poseidon, arity 10)
+//! ct_open_j = Enc_pkEA(opening_j, r_com_j; rho_enc_j)   (BabyJubJub-ElGamal
+//!                                                        + Poseidon-pad hybrid)
+//! pi_cast_j = ZK proof that com_j and ct_open_j open to the SAME
+//!             (opening_j, r_com_j)  — circuits/main/cast_proof.circom
+//! ```
 //!
-//! The ballot carries an `ea_payload` (the serialized opening) that models a
-//! private channel to the EA. This is a circuit-friendly commitment/opening
-//! relation, NOT public-key encryption: anyone holding the payload can open
-//! it. It is acceptable only as a first relation-checking prototype so the
-//! FilterAndTally circuit works end-to-end.
+//! pi_cast is verified PUBLICLY before tallying (zk::cast). The tally
+//! circuit never proves encryption/decryption: the EA decrypts ct_open
+//! natively (sk_EA) and the tally circuit HARD-checks that the decrypted
+//! opening opens com. Hybrid scheme:
 //!
-//! A native BabyJubJub ElGamal + Poseidon-pad hybrid backend is also
-//! implemented below as the intended production-shaped replacement; the
-//! circuit component for it is left as a documented TODO in
-//! `circuits/components/encryption_decrypt.circom`. Production encryption
-//! requires a full formal treatment (key validation, CCA transforms, etc.).
+//! ```text
+//! C1 = rho_enc * Base8,  ss = rho_enc * pk_EA,
+//! masked_i = m_i + Poseidon(ss.x, ss.y, i),   m = opening || r_com.
+//! ```
+//!
+//! Production encryption still requires a full formal treatment (key
+//! validation ceremonies, CCA transforms, etc.).
 
 use ark_ec::CurveGroup;
-use ark_ff::{UniformRand, Zero};
+use ark_ff::{BigInteger, PrimeField, UniformRand, Zero};
 use rand::{CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
 
-use crate::crypto::hash::ct_commit;
 use crate::crypto::poseidon_native::poseidon;
-use crate::crypto::signature::{base8, JubAffine, JubProjective, JubScalar};
+use crate::crypto::signature::{base8, JubProjective, JubScalar};
 use crate::errors::{CrDrError, Result};
 use crate::types::{f_to_bytes_be, fserde, fserde_vec, F, PLAINTEXT_FIELD_LEN};
+
+/// Number of encrypted fields in ct_open: the 9 opening fields + r_com.
+pub const CAST_CT_LEN: usize = PLAINTEXT_FIELD_LEN + 1;
 
 /// EA encryption secret key (BabyJubJub scalar).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,27 +63,32 @@ pub fn ea_keygen<R: RngCore + CryptoRng>(rng: &mut R) -> (EaSecretKey, EaPublicK
     (EaSecretKey(sk), EaPublicKey { x, y })
 }
 
-/// Public ciphertext as posted on the bulletin board. In commitment mode this
-/// is a single field element; in ElGamal-hybrid mode it is
-/// [C1.x, C1.y, masked_0..masked_8].
+/// The public encrypted opening ct_open_j = (C1, masked[10]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Ciphertext {
+pub struct CastCiphertext {
+    #[serde(with = "fserde")]
+    pub c1x: F,
+    #[serde(with = "fserde")]
+    pub c1y: F,
     #[serde(with = "fserde_vec")]
-    pub fields: Vec<F>,
+    pub masked: Vec<F>,
 }
 
-impl Ciphertext {
+impl CastCiphertext {
     /// Exact public byte encoding (32-byte BE per field, concatenated).
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.fields.len() * 32);
-        for f in &self.fields {
+        let mut out = Vec::with_capacity((2 + self.masked.len()) * 32);
+        out.extend_from_slice(&f_to_bytes_be(&self.c1x));
+        out.extend_from_slice(&f_to_bytes_be(&self.c1y));
+        for f in &self.masked {
             out.extend_from_slice(&f_to_bytes_be(f));
         }
         out
     }
 }
 
-/// Opening of a commitment-mode ciphertext (plaintext fields + rho).
+/// Opening of a ballot commitment: the 9 plaintext fields + r_com (named
+/// `rho` for continuity with the tally circuit's signal name).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EncOpening {
     #[serde(with = "fserde_vec")]
@@ -87,101 +97,73 @@ pub struct EncOpening {
     pub rho: F,
 }
 
-// ---------------------------------------------------------------------------
-// Commitment-mode backend (default; matched by the circuit)
-// ---------------------------------------------------------------------------
-
-/// Encrypt (commit) plaintext fields. Returns the public ciphertext and the
-/// opening. The caller packages the opening into the ballot's `ea_payload`.
-pub fn commit_encrypt<R: RngCore + CryptoRng>(
-    plaintext_fields: &[F; PLAINTEXT_FIELD_LEN],
-    rng: &mut R,
-) -> (Ciphertext, EncOpening) {
-    let rho = F::rand(rng);
-    let ct = ct_commit(plaintext_fields, rho);
-    (
-        Ciphertext { fields: vec![ct] },
-        EncOpening { plaintext_fields: plaintext_fields.to_vec(), rho },
-    )
+/// The voter-private cast secret: everything needed to produce pi_cast and
+/// to open the ballot in a dispute.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CastSecret {
+    pub opening: EncOpening,
+    /// ElGamal ephemeral randomness (a canonical BabyJubJub scalar < 2^251,
+    /// stored as a field element for the circuit witness).
+    #[serde(with = "fserde")]
+    pub rho_enc: F,
 }
 
-/// Serialize an opening into an EA payload.
-pub fn opening_to_payload(opening: &EncOpening) -> Vec<u8> {
-    serde_json::to_vec(opening).expect("opening serialization")
+fn pad(ssx: F, ssy: F, i: usize) -> F {
+    poseidon(&[ssx, ssy, F::from(i as u64)])
 }
 
-/// EA-side opening of a commitment-mode ballot: parse the payload and check
-/// it opens the public ciphertext. Any failure = InvalidDecryption upstream.
-pub fn commit_open(ciphertext: &Ciphertext, ea_payload: &[u8]) -> Result<EncOpening> {
-    if ciphertext.fields.len() != 1 {
-        return Err(CrDrError::Crypto("commitment-mode ciphertext must be 1 field".into()));
-    }
-    let opening: EncOpening = serde_json::from_slice(ea_payload)
-        .map_err(|e| CrDrError::Crypto(format!("payload parse failed: {e}")))?;
-    if opening.plaintext_fields.len() != PLAINTEXT_FIELD_LEN {
-        return Err(CrDrError::Crypto("wrong plaintext field count".into()));
-    }
-    let mut fields = [F::zero(); PLAINTEXT_FIELD_LEN];
-    fields.copy_from_slice(&opening.plaintext_fields);
-    if ct_commit(&fields, opening.rho) != ciphertext.fields[0] {
-        return Err(CrDrError::Crypto("opening does not match ciphertext".into()));
-    }
-    Ok(opening)
-}
-
-// ---------------------------------------------------------------------------
-// BabyJubJub ElGamal + Poseidon-pad hybrid (native demonstration backend)
-// ---------------------------------------------------------------------------
-// ciphertext = (C1, masked[9]) with C1 = r*B8, ss = r*PK,
-// masked_i = pt_i + Poseidon(ss.x, ss.y, i).
-// The circuit-side decryption check (ss = sk_EA * C1) is a documented TODO.
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ElGamalCiphertext {
-    pub c1: (F, F),
-    pub masked: [F; PLAINTEXT_FIELD_LEN],
-}
-
-fn pad(ss: &JubAffine, i: usize) -> F {
-    let (x, y) = crate::crypto::signature::to_circom_point(ss);
-    poseidon(&[x, y, F::from(i as u64)])
-}
-
-pub fn elgamal_encrypt<R: RngCore + CryptoRng>(
-    pk: &EaPublicKey,
-    plaintext_fields: &[F; PLAINTEXT_FIELD_LEN],
-    rng: &mut R,
-) -> Result<ElGamalCiphertext> {
-    let pk_point = crate::crypto::signature::decode_point(pk.x, pk.y)
-        .ok_or_else(|| CrDrError::Crypto("invalid EA public key".into()))?;
-    let r = loop {
+/// Sample nonzero ElGamal randomness (canonical scalar, as a field element).
+pub fn sample_rho_enc<R: RngCore + CryptoRng>(rng: &mut R) -> F {
+    loop {
         let r = JubScalar::rand(rng);
         if !r.is_zero() {
-            break r;
+            return F::from_le_bytes_mod_order(&r.into_bigint().to_bytes_le());
         }
-    };
-    let c1 = (JubProjective::from(base8()) * r).into_affine();
-    let ss = (JubProjective::from(pk_point) * r).into_affine();
-    let mut masked = [F::zero(); PLAINTEXT_FIELD_LEN];
-    for (i, pt) in plaintext_fields.iter().enumerate() {
-        masked[i] = *pt + pad(&ss, i);
     }
-    Ok(ElGamalCiphertext { c1: crate::crypto::signature::to_circom_point(&c1), masked })
 }
 
-pub fn elgamal_decrypt(
-    sk: &EaSecretKey,
-    ct: &ElGamalCiphertext,
-) -> Result<[F; PLAINTEXT_FIELD_LEN]> {
-    let c1 = crate::crypto::signature::decode_point(ct.c1.0, ct.c1.1)
+fn rho_to_scalar(rho_enc: F) -> Result<JubScalar> {
+    if !crate::crypto::signature::f_is_canonical_scalar(&rho_enc) || rho_enc.is_zero() {
+        return Err(CrDrError::Crypto("rho_enc must be a nonzero canonical scalar".into()));
+    }
+    Ok(crate::crypto::signature::jub_scalar_from_field(&rho_enc))
+}
+
+/// Hybrid-encrypt the 10 cast fields (opening || r_com) under pk_EA with
+/// the given ephemeral randomness. Deterministic given rho_enc, exactly
+/// matching the CastProof circuit.
+pub fn cast_encrypt(pk: &EaPublicKey, fields: &[F; CAST_CT_LEN], rho_enc: F) -> Result<CastCiphertext> {
+    let pk_point = crate::crypto::signature::decode_point(pk.x, pk.y)
+        .ok_or_else(|| CrDrError::Crypto("invalid EA public key".into()))?;
+    let r = rho_to_scalar(rho_enc)?;
+    let c1 = (JubProjective::from(base8()) * r).into_affine();
+    let ss = (JubProjective::from(pk_point) * r).into_affine();
+    let (c1x, c1y) = crate::crypto::signature::to_circom_point(&c1);
+    let (ssx, ssy) = crate::crypto::signature::to_circom_point(&ss);
+    let masked = fields
+        .iter()
+        .enumerate()
+        .map(|(i, m)| *m + pad(ssx, ssy, i))
+        .collect();
+    Ok(CastCiphertext { c1x, c1y, masked })
+}
+
+/// EA-side decryption of ct_open. Fails on malformed C1 (impossible for
+/// entries whose pi_cast verified) or wrong field count.
+pub fn cast_decrypt(sk: &EaSecretKey, ct: &CastCiphertext) -> Result<[F; CAST_CT_LEN]> {
+    if ct.masked.len() != CAST_CT_LEN {
+        return Err(CrDrError::Crypto("ct_open must carry 10 masked fields".into()));
+    }
+    let c1 = crate::crypto::signature::decode_point(ct.c1x, ct.c1y)
         .ok_or_else(|| CrDrError::Crypto("invalid C1".into()))?;
     if c1.is_zero() {
         return Err(CrDrError::Crypto("identity C1".into()));
     }
     let ss = (JubProjective::from(c1) * sk.0).into_affine();
-    let mut out = [F::zero(); PLAINTEXT_FIELD_LEN];
-    for i in 0..PLAINTEXT_FIELD_LEN {
-        out[i] = ct.masked[i] - pad(&ss, i);
+    let (ssx, ssy) = crate::crypto::signature::to_circom_point(&ss);
+    let mut out = [F::zero(); CAST_CT_LEN];
+    for i in 0..CAST_CT_LEN {
+        out[i] = ct.masked[i] - pad(ssx, ssy, i);
     }
     Ok(out)
 }
@@ -193,47 +175,34 @@ mod tests {
     use rand_chacha::ChaCha20Rng;
 
     #[test]
-    fn commitment_mode_roundtrip() {
-        let mut rng = ChaCha20Rng::seed_from_u64(3);
-        let fields = [F::from(9u64); PLAINTEXT_FIELD_LEN];
-        let (ct, opening) = commit_encrypt(&fields, &mut rng);
-        let payload = opening_to_payload(&opening);
-        let opened = commit_open(&ct, &payload).unwrap();
-        assert_eq!(opened.plaintext_fields, fields.to_vec());
-    }
-
-    #[test]
-    fn commitment_mode_rejects_tampered_payload() {
-        let mut rng = ChaCha20Rng::seed_from_u64(4);
-        let fields = [F::from(9u64); PLAINTEXT_FIELD_LEN];
-        let (ct, opening) = commit_encrypt(&fields, &mut rng);
-        let mut tampered = opening.clone();
-        tampered.plaintext_fields[4] = F::from(1234u64);
-        let payload = opening_to_payload(&tampered);
-        assert!(commit_open(&ct, &payload).is_err());
-    }
-
-    #[test]
-    fn elgamal_roundtrip() {
+    fn cast_hybrid_roundtrip() {
         let mut rng = ChaCha20Rng::seed_from_u64(5);
         let (sk, pk) = ea_keygen(&mut rng);
-        let mut fields = [F::zero(); PLAINTEXT_FIELD_LEN];
+        let mut fields = [F::zero(); CAST_CT_LEN];
         for (i, f) in fields.iter_mut().enumerate() {
             *f = F::from((i * 17 + 3) as u64);
         }
-        let ct = elgamal_encrypt(&pk, &fields, &mut rng).unwrap();
-        let dec = elgamal_decrypt(&sk, &ct).unwrap();
-        assert_eq!(dec, fields);
+        let rho = sample_rho_enc(&mut rng);
+        let ct = cast_encrypt(&pk, &fields, rho).unwrap();
+        assert_eq!(cast_decrypt(&sk, &ct).unwrap(), fields);
     }
 
     #[test]
-    fn elgamal_wrong_key_garbles() {
+    fn cast_hybrid_wrong_key_garbles() {
         let mut rng = ChaCha20Rng::seed_from_u64(6);
         let (_sk, pk) = ea_keygen(&mut rng);
         let (sk2, _pk2) = ea_keygen(&mut rng);
-        let fields = [F::from(5u64); PLAINTEXT_FIELD_LEN];
-        let ct = elgamal_encrypt(&pk, &fields, &mut rng).unwrap();
-        let dec = elgamal_decrypt(&sk2, &ct).unwrap();
-        assert_ne!(dec, fields);
+        let fields = [F::from(5u64); CAST_CT_LEN];
+        let rho = sample_rho_enc(&mut rng);
+        let ct = cast_encrypt(&pk, &fields, rho).unwrap();
+        assert_ne!(cast_decrypt(&sk2, &ct).unwrap(), fields);
+    }
+
+    #[test]
+    fn cast_rejects_zero_rho() {
+        let mut rng = ChaCha20Rng::seed_from_u64(7);
+        let (_sk, pk) = ea_keygen(&mut rng);
+        let fields = [F::from(5u64); CAST_CT_LEN];
+        assert!(cast_encrypt(&pk, &fields, F::zero()).is_err());
     }
 }

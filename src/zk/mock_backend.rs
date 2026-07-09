@@ -101,10 +101,13 @@ pub fn eval_row(
 ) -> Result<Rec, ()> {
     let pt = &row.pt_fields;
 
-    // open_ok (soft)
+    // ballot-commitment opening: HARD, gated by active (CAST-ZK format:
+    // pi_cast guarantees a decryptable opening exists for every entry)
     let mut inp = pt.to_vec();
     inp.push(row.rho);
-    let open_ok = poseidon(&inp) == row.ct;
+    if active && poseidon(&inp) != row.ct {
+        return Err(()); // hard: relation unsatisfiable
+    }
 
     // eid_ok (soft)
     let eid_ok = pt[0] == eid_hash;
@@ -119,8 +122,8 @@ pub fn eval_row(
         }
     }
 
-    // signature (hard sub-constraints)
-    let sig_ok = circuit_sig_ok(pt[2], pt[3], pt[6], pt[7], pt[8], sig_msg(pt))?;
+    // signature (soft-safe: never unsatisfiable, false for malformed input)
+    let sig_ok = circuit_sig_ok(pt[2], pt[3], pt[6], pt[7], pt[8], sig_msg(pt));
 
     // Deterministic in-range flag from the STRICT bit decomposition.
     let id_bits = pt[1].into_bigint().to_bits_le();
@@ -151,7 +154,7 @@ pub fn eval_row(
     let h_match = h == row.reg_h;
 
     let valid =
-        open_ok && eid_ok && cand_ok && sig_ok && in_range && vk_match && h_match && active;
+        eid_ok && cand_ok && sig_ok && in_range && vk_match && h_match && active;
 
     Ok(Rec {
         valid,
@@ -293,29 +296,31 @@ fn mul_bits(p: &JubAffine, bits: &[bool]) -> JubProjective {
     acc
 }
 
-/// Circuit semantics of the Schnorr verification component.
-/// Err(()) = a hard constraint is violated (relation unsatisfiable):
-/// off-curve points (BabyCheck), identity vk (Edwards2Montgomery), or
-/// S >= 2^251 (Num2Bits).
-fn circuit_sig_ok(ax: F, ay: F, rx: F, ry: F, s: F, msg: F) -> Result<bool, ()> {
+/// Circuit semantics of the SOFT-SAFE Schnorr verification component:
+/// NEVER unsatisfiable — off-curve points, torsion, identity, or oversized
+/// S simply yield false (matching the circuit's soft flags + muxed complete
+/// double-and-add). For well-formed inputs the result is unchanged.
+fn circuit_sig_ok(ax: F, ay: F, rx: F, ry: F, s: F, msg: F) -> bool {
     // Inputs are circomlib-form coordinates; map to ark form for arithmetic.
     let a = crate::crypto::signature::from_circom_point(ax, ay);
     let r = crate::crypto::signature::from_circom_point(rx, ry);
     if !a.is_on_curve() || !r.is_on_curve() {
-        return Err(()); // BabyCheck is a hard constraint
+        return false; // soft on-curve flags
     }
-    if a.is_zero() {
-        return Err(()); // Edwards2Montgomery(identity) is unsatisfiable
+    // S: strict decomposition, top-3-bits-zero soft flag; low 251 bits used.
+    let s_all = s.into_bigint().to_bits_le();
+    if s_all.iter().skip(251).take(3).any(|b| *b) {
+        return false;
     }
-    let Some(s_bits) = f_bits_le(&s, 251) else {
-        return Err(()); // Num2Bits(251) is a hard constraint
-    };
+    let s_bits: Vec<bool> = s_all.into_iter().take(251).collect();
     let c = poseidon(&[rx, ry, ax, ay, msg]);
     let c_bits = f_bits_le(&c, 254).expect("field elements fit 254 bits");
 
+    // ark's twisted-Edwards arithmetic is complete (identity and torsion
+    // included), mirroring the circuit's CompleteEscalarMul.
     let lhs = mul_bits(&base8(), &s_bits);
     let rhs = JubProjective::from(r) + mul_bits(&a, &c_bits);
-    Ok(lhs.into_affine() == rhs.into_affine())
+    lhs.into_affine() == rhs.into_affine()
 }
 
 #[cfg(test)]

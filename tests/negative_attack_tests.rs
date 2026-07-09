@@ -5,9 +5,10 @@
 
 mod common;
 
+use cr_dr::protocol::admission::admitted_from_ballots;
+
 use std::collections::HashSet;
 
-use cr_dr::crypto::encryption::commit_open;
 use cr_dr::crypto::hash::h_com;
 use cr_dr::disputes::judge::Verdict;
 use cr_dr::disputes::tallied_as_recorded::{
@@ -29,10 +30,10 @@ fn broken_tally_duplicates_before_validity(
     let mut counts = vec![0u64; env.pp.candidates.len()];
     let mut seen: HashSet<u64> = HashSet::new();
     for ballot in ballots {
-        let Ok(opening) = commit_open(&ballot.ciphertext, &ballot.ea_payload) else {
-            continue;
-        };
-        let Ok(pt) = BallotPlaintext::from_fields(&opening.plaintext_fields) else {
+        // (broken tallier reads the opening from the voter-side secret,
+        // standing in for its EA decryption of ct_open)
+        let Ok(pt) = BallotPlaintext::from_fields(&ballot.secret.opening.plaintext_fields)
+        else {
             continue;
         };
         // WRONG: slot consumed before any validity check.
@@ -41,7 +42,7 @@ fn broken_tally_duplicates_before_validity(
         }
         // validity after duplicate handling (the bug)
         let (_, evals) =
-            filter_and_tally(&env.pp, &env.authority, &env.reg, &[ballot.clone()]).unwrap();
+            { let (adm, opn) = admitted_from_ballots(&[ballot.clone()]); filter_and_tally(&env.pp, &env.authority, &env.reg, &adm, &opn) }.unwrap();
         if evals[0].status == InternalBallotStatus::Counted {
             let pos = env.pp.candidates.iter().position(|c| *c == pt.candidate).unwrap();
             counts[pos] += 1;
@@ -65,7 +66,7 @@ fn duplicate_handling_before_validity_lets_fake_block_real() {
     assert_eq!(broken, vec![0, 0, 0]);
 
     // Correct order: the real vote counts.
-    let (tally, _) = filter_and_tally(&env.pp, &env.authority, &env.reg, &board).unwrap();
+    let (tally, _) = { let (adm, opn) = admitted_from_ballots(&board); filter_and_tally(&env.pp, &env.authority, &env.reg, &adm, &opn) }.unwrap();
     assert_eq!(tally.counts, vec![1, 0, 0]);
 }
 
@@ -82,7 +83,7 @@ fn publishing_accepted_identities_leaks_forced_abstention() {
         cast_vote(&env.pp, &env.reg, &coerced, 0, &mut env.rng).unwrap(),
         cast_vote(&env.pp, &env.reg, &env.voters[1].clone(), 1, &mut env.rng).unwrap(),
     ];
-    let (tally, internal) = filter_and_tally(&env.pp, &env.authority, &env.reg, &board).unwrap();
+    let (tally, internal) = { let (adm, opn) = admitted_from_ballots(&board); filter_and_tally(&env.pp, &env.authority, &env.reg, &adm, &opn) }.unwrap();
 
     // THE LEAK (if internal data were published): the coerced voter's id
     // appears as counted even though the coercer only authorized the fake.
@@ -136,23 +137,20 @@ fn public_detailed_verdicts_leak_evasion_status() {
     let t = fake_compliance(&env.pp, &coerced, 2, &mut env.rng).unwrap();
     let fake = build_fake_ballot(&env.pp, &t, &mut env.rng).unwrap();
     let real = cast_vote(&env.pp, &env.reg, &coerced, 0, &mut env.rng).unwrap();
-    let mut bb = BulletinBoard::new();
-    bb.append(fake.public());
-    bb.append(real.public());
+    let (adm, opn) = admitted_from_ballots(&[fake.clone(), real.clone()]);
     let (_, evals) =
-        filter_and_tally(&env.pp, &env.authority, &env.reg, &[fake.clone(), real.clone()])
-            .unwrap();
+        filter_and_tally(&env.pp, &env.authority, &env.reg, &adm, &opn).unwrap();
     let r_ea = env.authority.r_ea(coerced.id).unwrap();
 
     let judge = |ballot: &cr_dr::types::Ballot| {
-        let opening = commit_open(&ballot.ciphertext, &ballot.ea_payload).unwrap();
-        let complaint = TalliedAsRecordedComplaint { ballot: ballot.clone(), opening };
+        let opening = ballot.secret.opening.clone();
+        let complaint = TalliedAsRecordedComplaint { com: ballot.com, opening };
         let evidence = AuthorityEvidence {
             nonce_source: NonceSource::Direct(r_ea),
             prior_evaluations: &evals,
             tally_proof: TallyProofStatus::Verified,
         };
-        judge_tallied_as_recorded(&env.pp, &env.reg, &bb, &complaint, &evidence)
+        judge_tallied_as_recorded(&env.pp, &env.reg, &adm, &complaint, &evidence)
     };
 
     let fake_report = judge(&fake);

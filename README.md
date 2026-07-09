@@ -54,9 +54,39 @@ leaf_i = H_reg(eid, i, vk_i, h_i)              (Poseidon)
 MR     = Merkle root over (leaf_0, ..., leaf_{N-1})
 ```
 
-A ballot encrypts `(eid, i, vk_i, m, R, sigma)` with
-`sigma = Sign_sk_i(eid, i, m, R)` and is posted through an **anonymous
-channel that preserves exact ballot bytes**.
+A ballot is cast in the **CAST-ZK format**: the public board entry is
+`B_j = (com_j, ct_open_j, pi_cast_j)` where
+`com_j = H_ballot_com(opening_j, r_com_j)` commits to the opening
+`(eid, i, vk_i, m, R, sigma)` with `sigma = Sign_sk_i(eid, i, m, R)`,
+`ct_open_j = Enc_pkEA(opening_j, r_com_j; rho_enc_j)` encrypts the same
+data to the EA (BabyJubJub-ElGamal + Poseidon-pad hybrid), and `pi_cast_j`
+is a small ZK proof (6,095 constraints, ~50 ms to produce) that `com` and
+`ct_open` open to the SAME data. `pi_cast` is **verified publicly before
+tallying** — never inside the tally circuit — so the EA can always decrypt
+exactly the committed opening, and the tally circuit HARD-checks that the
+decrypted opening opens `com` (the prover cannot withhold an opening to
+soft-invalidate a ballot). The protocol supports **two admission paths**, never
+mixed implicitly:
+
+* **Path 1 — public anonymous cast-ZK**: voters post raw entries
+  `B = (com, ct_open, pi_cast)` anonymously onto **BB_raw** (exact bytes
+  preserved); ANYONE recomputes the admitted board
+  `BB_adm = Clean(BB_raw)` by verifying every pi_cast
+  (`protocol::admission::clean`). Fake-compliance and chaff entries pass
+  admission (their pi_cast is valid!) and fail only the hidden validity
+  inside the private tally relation. The EA obtains tally openings by
+  decrypting the admitted ct_opens.
+* **Path 2 — EA-mediated private submission**: the voter privately sends
+  `(com, opening, r_com)` to the EA; the EA checks ONLY that the opening
+  opens com and returns `receipt = Sign_EA(eid, com, timestamp)` — the
+  receipt certifies ADMISSION only, never hidden validity or counted
+  status, so fake-nonce ballots receive identical receipts (no coercion
+  test). The EA later posts BB_adm; recorded-as-cast disputes use the
+  receipt.
+
+The exact tally proof is COMMON to both paths: it runs over
+`BB_adm = [com_1..com_M]`, hard-opens every commitment with the witness
+opening, and computes private validity + sorted-record duplicates.
 
 * **Uncoerced voter:** signs with her real `R_i`; the authority — who knows
   `R_EA,i` — recomputes `h_i` and checks the Merkle relation. Valid.
@@ -266,18 +296,21 @@ depth 4, ≈116k constraints), medium (128 / 3 / 6, ≈1.0M), each also as a
   changing the relation. Not implemented; **no decentralized proving is
   claimed or benchmarked**.
 
-### ⚠️ Commitment-mode encryption prototype
+### Cast-ZK encryption (BabyJubJub-ElGamal + Poseidon-pad hybrid)
 
-The default ballot "encryption" is a **commitment-opening relation, not
-public-key encryption**: `ct = Poseidon(plaintext_fields ‖ rho)`, with the
-opening carried to the EA over a modeled private payload channel. This is
-the acceptable first step for getting the exact relation to prove; the code
-is structured for the intended swap-in: a native BabyJubJub-ElGamal +
-Poseidon-pad hybrid backend already exists
-(`crypto::encryption::elgamal_*`), and
-`circuits/components/encryption_decrypt.circom` documents the exact circuit
-replacement (`ss = sk_EA · C1`). Production encryption needs a full formal
-treatment.
+Ballot encryption is REAL public-key encryption since the CAST-ZK format:
+`ct_open = Enc_pkEA(opening, r_com; rho_enc)` with `C1 = rho_enc*Base8`,
+`ss = rho_enc*pk_EA`, `masked_i = m_i + Poseidon(ss.x, ss.y, i)`. The cast
+proof `pi_cast` (circuits/main/cast_proof.circom) publicly binds `ct_open`
+to `com`; the tally circuit never proves encryption or decryption — it
+receives the EA-decrypted opening and hard-checks it against `com`. Two
+soft-safety consequences inside the tally relation: the commitment opening
+became a HARD gated constraint, and the Schnorr gadget became SOFT-SAFE
+for arbitrary field inputs (soft on-curve flags, muxed inputs, complete
+Edwards double-and-add for c·A — circomlib's Montgomery ladder is unsafe
+for torsion inputs), so no voter-chosen opening can make the tally witness
+unsatisfiable. Production encryption still needs a formal treatment
+(key-validation ceremonies, CCA transforms).
 
 ### ⚠️ Dev-only trusted setup
 
@@ -427,9 +460,9 @@ receipt in a coercer's hands; it needs a separate treatment.
 | file | implements |
 |---|---|
 | `poseidon_native.rs` | `poseidon(&[F]) -> F` via `light-poseidon`, parameter-identical to circomlib's `Poseidon`; unit tests pin known circomlibjs vectors. Every in-circuit hash routes through this. |
-| `hash.rs` | All protocol hashes: `eid_to_field` (SHA-256 → field, outside the circuit), **`h_com`** (`H_com`, arity 6), **`h_reg`** (`H_reg`, arity 5), `sig_msg_hash` (arity 4), `ct_commit` (commitment-mode ciphertext, arity 10), `merkle_hash` (arity 2), `bb_commitment` (Poseidon chain over posted ciphertext fields), `candidate_set_commitment`, `pk_ea_commitment`, `ballot_hash` (for receipts). |
+| `hash.rs` | All protocol hashes: `eid_to_field` (SHA-256 → field, outside the circuit), **`h_com`** (`H_com`, arity 6), **`h_reg`** (`H_reg`, arity 5), `sig_msg_hash` (arity 4), `ct_commit` (H_ballot_com, the ballot commitment, arity 10), `merkle_hash` (arity 2), `bb_commitment` (Poseidon chain over posted ciphertext fields), `candidate_set_commitment`, `pk_ea_commitment`, `ballot_hash` (for receipts). |
 | `signature.rs` | The ZK-friendly signature: **Schnorr over BabyJubJub with Poseidon challenge** — `keygen`, `sign`, `verify` (checks `S·B8 == R + c·A`), `challenge`. Also the circomlib⇄arkworks curve-form isomorphism (`to_circom_point`/`from_circom_point`, `x_ark = √168700·x_circom`), circomlib `Base8` constants, scalar embedding helpers (`jub_scalar_from_field`, `f_is_canonical_scalar`), point decoding with subgroup checks, and scalar serde. |
-| `encryption.rs` | Both ballot-encryption backends. **Commitment mode (default, circuit-matched)**: `commit_encrypt` (`ct = Poseidon(fields‖rho)`), `commit_open`, `opening_to_payload` — with the loud not-real-PKE warning. **BabyJubJub ElGamal + Poseidon-pad hybrid (native, swap-in target)**: `ea_keygen`, `elgamal_encrypt`, `elgamal_decrypt`. `Ciphertext::to_bytes` fixes the exact public byte encoding used for recorded-as-cast. |
+| `encryption.rs` | CAST-ZK encryption: `CastCiphertext` (C1 + masked[10]), `cast_encrypt`/`cast_decrypt` (BabyJubJub-ElGamal + Poseidon-pad hybrid, deterministic given rho_enc — matches cast_proof.circom), `CastSecret` (opening, r_com, rho_enc — voter-held), `sample_rho_enc`, EA keygen. |
 | `merkle.rs` | Fixed-depth Poseidon Merkle tree over registration leaves: `MerkleTree::new/root/path`, `MerklePath`, `verify_path` — bit-for-bit the circuit's `MerkleMembership`. |
 | `shamir.rs` | Shamir secret sharing over BN254: `share` (degree t−1 polynomial), `reconstruct` (Lagrange at 0), with tests that <t shares don't reconstruct. |
 
@@ -439,10 +472,11 @@ receipt in a coercer's hands; it needs a separate treatment.
 |---|---|
 | `setup.rs` | `setup_election(config)` → (`PublicParams`, `AuthoritySecretState`): validates candidates/capacities/threshold params; generates the EA encryption keypair and EA receipt-signing keypair. |
 | `preprocessing.rs` | **Threshold-private registration** (idealized functionality F_prep). `voter_registration_secrets`: the VOTER samples (sk_i, vk_i, R_i). `preprocess_voter`: authority side threshold-generates R_EA,i (Shamir t-of-k, plain value erased), F_prep computes h_i/leaf_i; voter gets (sk,vk,R), authority gets ONLY shares, public gets (i, vk_i, h_i, leaf_i). `finalize_registration`: enforces DENSE ids 0..N-1 (indexed table: id = leaf index), Merkle tree over leaves, `RegistrationState`. **Cut-and-choose**: `preprocess_voter_cut_and_choose` (voter's R fixed; q candidate R_EA^k, q−1 audited by opening, unopened pair final + threshold-shared), `..._with_cheat` (test hook), `estimate_cut_and_choose_soundness` (Monte-Carlo ≈ 1/q). |
-| `vote.rs` | `cast_vote`: candidate check, `sigma = Sign_sk(eid, i, m, R_i)`, encrypt the 9-field plaintext, fix the exact public bytes. |
+| `vote.rs` | `seal_ballot` — the CAST-ZK sealing shared by real votes, fake-compliance and chaff (com + ct_open + CastSecret); `cast_vote`: candidate check, `sigma = Sign_sk(eid, i, m, R_i)`, seal. |
 | `fake_compliance.rs` | **The coercion story.** `FakeComplianceTranscript` — what the voter surrenders (REAL sk_i, FAKE nonce R*, requested candidate, valid signature). `fake_compliance` builds it (samples R* ≠ R_i); `build_fake_ballot` produces the coercer's ballot, publicly indistinguishable from a real one. |
+| `admission.rs` | The two admission paths. Path 1: `clean` (BB_adm = Clean(BB_raw), keep valid-pi_cast entries), `ea_open_admitted` (EA decrypts admitted ct_opens). Path 2: `ea_admit_private` (admission-level check ONLY + Sign_EA(eid, com, ts) receipt), `EaAdmissionState`. `AdmittedOpenings` (EA-private, aligned with BB_adm); `admitted_from_ballots` (test/bench helper modeling an already-admitted board). |
 | `chaff.rs` | `chaff_ballot`: fresh unregistered identity, in-range voter id, valid signature — passes every syntactic check, fails only the hidden registration relation; same shape and rejection class as fake ballots. |
-| `bulletin_board.rs` | `BulletinBoard` (append-only over `PublicBallot`s — ciphertexts only, safe to publish wholesale; `list_public_ballots`, **`contains_exact_bytes`** for recorded-as-cast) and `AnonymousChannel` (`submit`, `flush_shuffled` — drops sender identity, shuffles order, preserves bytes). |
+| `bulletin_board.rs` | `BulletinBoard` (**BB_raw**: raw (com, ct_open) entries, exact-bytes membership for Path-1 recorded-as-cast), `AdmittedBoard` (**BB_adm**: the admitted commitment list the tally processes), `RawSubmission` (entry + pi_cast), `AnonymousChannel` (drops sender identity, shuffles, preserves bytes). |
 | `filter_and_tally.rs` | **Exact FilterAndTally.** Per ballot: (a) open/decrypt → (b) parse → (c) eid → (d) candidate ∈ C → (e) signature → (f)-(h) `registration_check` — the shared deterministic INDEXED-row predicate (row Reg[id] selected by the claimed id; vk equality; hidden nonce relation via authorized ≥t R_EA reconstruction; leaf/root consistency) → (i) *only now valid* → emit record r_j. Duplicates via sorted-record Strategy B (`duplicates.rs`), then tally. `registration_check` is also the judge's predicate — tally and disputes always agree. Validity-before-duplicates lives here. |
 | `duplicates.rs` | Duplicate strategies over private records r_j = (valid, id, pos, m): `counted_flags_naive` (Strategy A, O(B²) reference) and `counted_flags_sorted` (Strategy B, MAIN: sort by (-valid,id,pos), explicit multiset-equality check, linear first-in-identity-block pass). Both agree on all inputs (tested incl. randomized). |
 
@@ -461,6 +495,7 @@ receipt in a coercer's hands; it needs a separate treatment.
 | `statement.rs` | `TallyStatement` — the public inputs and nothing else (eid_hash, MR, candidate-set commitment, bb_commitment, counts, sizes, rule id, pk_ea commitment); `build_tally_statement` from public data only; `statement_matches_public_data` — the native check verifiers must run alongside the proof (binds `num_voters`/`pk_ea_commitment`, which the circuit cannot constrain). |
 | `witness.rs` | `TallyWitness`/`BallotWitnessRow` (per-ballot private inputs: ct, 9 plaintext fields, rho, R_EA, indexed row values reg_vk/reg_h, sibling path at index id — direction bits are id's own bits, not witness). Documents the **prover tiers** (Tier 1 single prover implemented; Tier 3 replaces the share-based `r_ea()` call with MPC). `build_tally_witness` mirrors FilterAndTally and applies the **dummy-substitution policy** for hard-constraint-unsafe ballots. `padding_row`/`padded_rows` fill circuit slots beyond `num_ballots`. |
 | `mock_backend.rs` | `relation_check_native` — the native mirror of the circuit, constraint-for-constraint: soft flags, deterministic strict-bits in-range flag, HARD gated indexed-row/root check (unsatisfiable ⇒ false), `batcher_schedule` (THE sorting-network schedule, shared with the circom side), sorted-record counting, BB chain, tally equality. Includes `circuit_sig_ok` with **bit-exact integer scalar multiplication** (`mul_bits`) matching circomlib semantics. |
+| `cast.rs` | pi_cast: `prove_cast` / `verify_cast_entry` (public-input binding + Groth16 verify + C1 subgroup check), `cast_relation_check_native` (mirror), input serialization. Verified PUBLICLY before tallying; never inside the tally circuit. |
 | `chunked.rs` | The CHUNKED pipeline: `build_chunked_tally` (records via the shared `eval_row`, global sort, blinded rc/sc commitments, Fiat-Shamir challenges, boundary chain, partial tallies, grand products), `chunked_relation_check_native` (every chunk-circuit constraint + every aggregator check), circom input serialization and expected public-input vectors per proof. |
 | `circom_io.rs` | `generate_witness_input` — serializes (statement, witness) into the circuit's `input.json` (decimal strings, signal names matching the main component); `statement_public_inputs`/`public_inputs_match` — the exact snarkjs `public.json` a proof of a statement must carry (verifiers reject proofs bound to any other statement). |
 | `groth16_backend.rs` | `SnarkjsBackend` — Groth16 via the snarkjs CLI: artifact discovery (`toolchain_available`), `generate_witness` (wasm), `prove` → (proof.json, public.json), `verify`. Race-free per-call work directories. `RapidsnarkBackend` — optional NATIVE prover (iden3 rapidsnark, C++): same .zkey/.wtns, ~12–14× faster prove step, proofs verify under the same snarkjs verification keys (`discover` via $RAPIDSNARK_PROVER or the build tree). |
@@ -479,8 +514,8 @@ receipt in a coercer's hands; it needs a separate treatment.
 |---|---|
 | `components/poseidon_hashes.circom` | `HCom`, `HReg`, `MessageHashForSignature` — the three protocol hashes as Poseidon gadgets (arities 6/5/4, matching `crypto/hash.rs`). |
 | `components/merkle_membership.circom` | `MerkleMembership(depth)` — generic soft membership check (kept for reference; ballot validity now uses the HARD id-indexed row fetch inside `ballot_validity.circom`). |
-| `components/signature_verify.circom` | `SchnorrVerify` — in-circuit Schnorr: Poseidon challenge, `Num2Bits`, circomlib `EscalarMulAny` (c·A) and `EscalarMulFix` (S·Base8), `BabyAdd`, point equality as a soft flag; `BabyCheck` on-curve checks are the documented hard constraints. |
-| `components/encryption_decrypt.circom` | `CiphertextOpen(nFields)` — commitment-mode opening check (soft), plus the documented TODO for the BabyJubJub-ElGamal decryption swap (`ss = sk_EA·C1`). |
+| `components/signature_verify.circom` | `SchnorrVerify` — SOFT-SAFE in-circuit Schnorr: soft Edwards on-curve flags with Base8 muxing, COMPLETE double-and-add for c·A (`CompleteEscalarMul`; safe for identity/torsion), strict S decomposition with soft top-zero flag, `EscalarMulFix` for S·Base8. Never unsatisfiable for any field inputs. |
+| `main/cast_proof.circom` | `CastProof` — pi_cast: com = Poseidon(opening ‖ r_com) AND ct_open = hybrid-Enc(pk_EA, opening ‖ r_com; rho_enc), rho_enc ≠ 0. All-hard (a failing pi_cast rejects the entry publicly, pre-tally). 6,095 constraints. |
 | `components/ballot_validity.circom` | `BallotValidity(depth, nCand)` — soft flags (opening ∧ eid ∧ candidate one-hot ∧ signature ∧ vk-match ∧ nonce-relation) × deterministic `in_range` (strict id bits) × active; HARD gated indexed-row fetch: leaf = HReg(eid, id, reg_vk, reg_h), Merkle directions = bits of id, root === MR. Emits the record fields (`valid`, `id_eff`, `m`, `candSel`). |
 | `components/duplicate_first_valid.circom` | `DuplicateFirstValid(nB)` — Strategy A (benchmark baseline), O(B²): `counted[j] = valid[j] · Π_{k<j}(1 − valid[k]·same_id(k,j))`; invalid ballots can never block. |
 | `components/sort_records.circom` | Strategy B permutation machinery: `CompareExchangeRecord` (packed key `(1-valid)·2^16 + id·2^8 + pos`, GreaterThan(17) + conditional swap) and `SortRecords(nB)` — Batcher odd-even mergesort network (schedule identical to `mock_backend::batcher_schedule`); sorted-by-construction = sound permutation + sortedness with no sampled challenge. |

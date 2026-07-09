@@ -9,7 +9,8 @@
 
 mod common;
 
-use cr_dr::protocol::bulletin_board::BulletinBoard;
+use cr_dr::protocol::admission::admitted_from_ballots;
+
 use cr_dr::protocol::chaff::chaff_ballot;
 use cr_dr::protocol::fake_compliance::{build_fake_ballot, fake_compliance};
 use cr_dr::protocol::filter_and_tally::filter_and_tally;
@@ -44,16 +45,13 @@ fn build_valid_input(seed: u64) -> (serde_json::Value, cr_dr::zk::statement::Tal
     ballots.push(cast_vote(&env.pp, &env.reg, &v1, 1, &mut env.rng).unwrap());
     ballots.push(cast_vote(&env.pp, &env.reg, &v2, 1, &mut env.rng).unwrap());
     ballots.push(chaff_ballot(&env.pp, &mut env.rng).unwrap());
-    let mut bb = BulletinBoard::new();
-    for b in &ballots {
-        bb.append(b.public());
-    }
-
-    let (tally, _) = filter_and_tally(&env.pp, &env.authority, &env.reg, &ballots).unwrap();
+    let (admitted, openings) = admitted_from_ballots(&ballots);
+    let (tally, _) =
+        filter_and_tally(&env.pp, &env.authority, &env.reg, &admitted, &openings).unwrap();
     assert_eq!(tally.counts, vec![1, 2, 0]); // real vote for 0 counted, fake for 2 rejected
-    let statement = build_tally_statement(&env.pp, &bb, &env.reg, &tally);
+    let statement = build_tally_statement(&env.pp, &admitted, &env.reg, &tally);
     let witness =
-        build_tally_witness(&env.pp, &env.authority, &env.reg, &ballots).unwrap();
+        build_tally_witness(&env.pp, &env.authority, &env.reg, &admitted, &openings).unwrap();
     assert!(relation_check_native(&statement, &witness, &SMALL_SHAPE));
     (generate_witness_input(&statement, &witness, &SMALL_SHAPE).unwrap(), statement)
 }

@@ -1,5 +1,7 @@
 mod common;
 
+use cr_dr::protocol::admission::admitted_from_ballots;
+
 use cr_dr::protocol::filter_and_tally::filter_and_tally;
 use cr_dr::protocol::vote::cast_vote;
 use cr_dr::types::InternalBallotStatus;
@@ -9,7 +11,7 @@ fn real_ballot_is_counted() {
     let mut env = common::small_election(20);
     let ballot = cast_vote(&env.pp, &env.reg, &env.voters[0], 1, &mut env.rng).unwrap();
     let (tally, evals) =
-        filter_and_tally(&env.pp, &env.authority, &env.reg, &[ballot]).unwrap();
+        { let (adm, opn) = admitted_from_ballots(&[ballot.clone()]); filter_and_tally(&env.pp, &env.authority, &env.reg, &adm, &opn) }.unwrap();
     assert_eq!(tally.counts, vec![0, 1, 0]);
     assert_eq!(tally.counted_ballots, 1);
     assert_eq!(evals[0].status, InternalBallotStatus::Counted);
@@ -37,7 +39,7 @@ fn several_voters_tally_correctly() {
         let voter = env.voters[i].clone();
         ballots.push(cast_vote(&env.pp, &env.reg, &voter, *cand, &mut env.rng).unwrap());
     }
-    let (tally, _) = filter_and_tally(&env.pp, &env.authority, &env.reg, &ballots).unwrap();
+    let (tally, _) = { let (adm, opn) = admitted_from_ballots(&ballots); filter_and_tally(&env.pp, &env.authority, &env.reg, &adm, &opn) }.unwrap();
     assert_eq!(tally.counts, vec![3, 2, 1]);
     assert_eq!(tally.counted_ballots, 6);
 }
@@ -46,6 +48,9 @@ fn several_voters_tally_correctly() {
 fn ballot_bytes_are_the_exact_public_ciphertext_encoding() {
     let mut env = common::small_election(24);
     let ballot = cast_vote(&env.pp, &env.reg, &env.voters[0], 1, &mut env.rng).unwrap();
-    assert_eq!(ballot.bytes(), ballot.ciphertext.to_bytes());
-    assert_eq!(ballot.bytes().len(), 32); // one field element in commitment mode
+    // bytes = com || C1 || masked (13 field elements, 32 bytes each)
+    let mut expected = cr_dr::types::f_to_bytes_be(&ballot.com).to_vec();
+    expected.extend_from_slice(&ballot.ct_open.to_bytes());
+    assert_eq!(ballot.bytes(), expected);
+    assert_eq!(ballot.bytes().len(), 13 * 32);
 }

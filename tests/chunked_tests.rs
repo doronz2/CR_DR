@@ -4,7 +4,7 @@
 
 mod common;
 
-use cr_dr::protocol::bulletin_board::{AnonymousChannel, BulletinBoard};
+use cr_dr::protocol::admission::admitted_from_ballots;
 use cr_dr::protocol::chaff::chaff_ballot;
 use cr_dr::protocol::fake_compliance::{build_fake_ballot, fake_compliance};
 use cr_dr::protocol::filter_and_tally::filter_and_tally;
@@ -41,29 +41,28 @@ fn build_instance(seed: u64, num_ballots: usize) -> (ChunkedTally, Vec<u64>) {
     }
     let reg = finalize_registration(&pp, &records).unwrap();
 
-    let mut channel = AnonymousChannel::new();
+    let mut ballots = Vec::new();
     for v in voters.iter().take(5) {
         let t = fake_compliance(&pp, v, 2, &mut rng).unwrap();
-        channel.submit(build_fake_ballot(&pp, &t, &mut rng).unwrap());
-        channel.submit(cast_vote(&pp, &reg, v, 0, &mut rng).unwrap());
+        ballots.push(build_fake_ballot(&pp, &t, &mut rng).unwrap());
+        ballots.push(cast_vote(&pp, &reg, v, 0, &mut rng).unwrap());
     }
     for (i, v) in voters.iter().enumerate().skip(5) {
-        channel.submit(cast_vote(&pp, &reg, v, 1 + (i as u64 % 2), &mut rng).unwrap());
+        ballots.push(cast_vote(&pp, &reg, v, 1 + (i as u64 % 2), &mut rng).unwrap());
     }
     let submitted = 5 + voters.len();
     for _ in submitted..num_ballots {
-        channel.submit(chaff_ballot(&pp, &mut rng).unwrap());
+        ballots.push(chaff_ballot(&pp, &mut rng).unwrap());
     }
-    let mut bb = BulletinBoard::new();
-    let mut ballots = Vec::new();
-    for b in channel.flush_shuffled(&mut rng) {
-        bb.append(b.public());
-        ballots.push(b);
-    }
+    // shuffled voter-side; the test models an already-admitted board
+    use rand::seq::SliceRandom;
+    ballots.shuffle(&mut rng);
 
-    let (tally, _) = filter_and_tally(&pp, &authority, &reg, &ballots).unwrap();
-    let ct = build_chunked_tally(&pp, &authority, &reg, &ballots, &bb, CHUNK_SIZE, &mut rng)
-        .unwrap();
+    let (admitted, openings) = admitted_from_ballots(&ballots);
+    let (tally, _) = filter_and_tally(&pp, &authority, &reg, &admitted, &openings).unwrap();
+    let ct =
+        build_chunked_tally(&pp, &authority, &reg, &admitted, &openings, CHUNK_SIZE, &mut rng)
+            .unwrap();
     (ct, tally.counts)
 }
 

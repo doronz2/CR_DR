@@ -1,5 +1,7 @@
 mod common;
 
+use cr_dr::protocol::admission::admitted_from_ballots;
+
 use cr_dr::protocol::fake_compliance::{build_fake_ballot, fake_compliance};
 use cr_dr::protocol::filter_and_tally::filter_and_tally;
 use cr_dr::protocol::vote::cast_vote;
@@ -11,7 +13,7 @@ fn first_valid_ballot_counts_second_ignored() {
     let voter = env.voters[0].clone();
     let b1 = cast_vote(&env.pp, &env.reg, &voter, 1, &mut env.rng).unwrap();
     let b2 = cast_vote(&env.pp, &env.reg, &voter, 2, &mut env.rng).unwrap();
-    let (tally, _) = filter_and_tally(&env.pp, &env.authority, &env.reg, &[b1, b2]).unwrap();
+    let (tally, _) = { let (adm, opn) = admitted_from_ballots(&[b1.clone(), b2.clone()]); filter_and_tally(&env.pp, &env.authority, &env.reg, &adm, &opn) }.unwrap();
     assert_eq!(tally.counts, vec![0, 1, 0]);
 }
 
@@ -30,7 +32,7 @@ fn invalid_ballots_never_consume_the_slot() {
         cast_vote(&env.pp, &env.reg, &voter, 1, &mut env.rng).unwrap(),
     ];
     let (tally, evals) =
-        filter_and_tally(&env.pp, &env.authority, &env.reg, &ballots).unwrap();
+        { let (adm, opn) = admitted_from_ballots(&ballots); filter_and_tally(&env.pp, &env.authority, &env.reg, &adm, &opn) }.unwrap();
     assert_eq!(evals[0].status, InternalBallotStatus::InvalidRegistration);
     assert_eq!(evals[1].status, InternalBallotStatus::InvalidRegistration);
     assert_eq!(evals[2].status, InternalBallotStatus::Counted);
@@ -46,7 +48,7 @@ fn real_then_fake_keeps_real_counted() {
     let t = fake_compliance(&env.pp, &voter, 2, &mut env.rng).unwrap();
     let fake = build_fake_ballot(&env.pp, &t, &mut env.rng).unwrap();
     let (tally, evals) =
-        filter_and_tally(&env.pp, &env.authority, &env.reg, &[real, fake]).unwrap();
+        { let (adm, opn) = admitted_from_ballots(&[real.clone(), fake.clone()]); filter_and_tally(&env.pp, &env.authority, &env.reg, &adm, &opn) }.unwrap();
     assert_eq!(evals[0].status, InternalBallotStatus::Counted);
     assert_eq!(evals[1].status, InternalBallotStatus::InvalidRegistration);
     assert_eq!(tally.counts, vec![1, 0, 0]);
@@ -63,7 +65,7 @@ fn duplicates_across_different_voters_do_not_interact() {
         cast_vote(&env.pp, &env.reg, &v1, 1, &mut env.rng).unwrap(),
     ];
     let (tally, evals) =
-        filter_and_tally(&env.pp, &env.authority, &env.reg, &ballots).unwrap();
+        { let (adm, opn) = admitted_from_ballots(&ballots); filter_and_tally(&env.pp, &env.authority, &env.reg, &adm, &opn) }.unwrap();
     assert_eq!(evals[2].status, InternalBallotStatus::DuplicateValidBallot);
     assert_eq!(tally.counts, vec![2, 0, 0]);
 }

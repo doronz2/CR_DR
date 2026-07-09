@@ -1,3 +1,4 @@
+pub mod admission;
 pub mod bulletin_board;
 pub mod chaff;
 pub mod duplicates;

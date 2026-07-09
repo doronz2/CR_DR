@@ -6,9 +6,17 @@ pragma circom 2.0.0;
 //
 // Check classes:
 //
-// * SOFT (drive the 0/1 `valid` flag): ciphertext opening, election-id
-//   binding, candidate membership, Schnorr signature, vk equality against
-//   the registration row, and the hidden nonce relation
+// * HARD, gated by active: the ballot-commitment opening
+//   com === Poseidon(pt || rho). Under the CAST-ZK format every board
+//   entry carries a publicly verified pi_cast, so the EA can always
+//   decrypt the opening that satisfies this — the prover cannot withhold
+//   an opening to soft-invalidate a ballot, and a voter cannot make the
+//   tally unsatisfiable (all downstream checks are soft-safe for
+//   arbitrary opening fields, incl. the Schnorr gadget).
+//
+// * SOFT (drive the 0/1 `valid` flag): election-id binding, candidate
+//   membership, Schnorr signature (soft-safe), vk equality against the
+//   registration row, and the hidden nonce relation
 //   h = H_com(eid, id, vk, R, R_EA) against the row's h.
 //
 // * DETERMINISTIC in-range flag: the claimed id is decomposed with
@@ -31,7 +39,6 @@ include "circomlib/circuits/bitify.circom";
 include "circomlib/circuits/poseidon.circom";
 include "./poseidon_hashes.circom";
 include "./signature_verify.circom";
-include "./encryption_decrypt.circom";
 
 template BallotValidity(depth, nCand) {
     signal input eid_hash;          // public election id hash
@@ -53,13 +60,13 @@ template BallotValidity(depth, nCand) {
     signal output m;                // candidate index (0 if no match)
     signal output candSel[nCand];
 
-    // (1) ciphertext opening / decryption (soft)
-    component open = CiphertextOpen(9);
-    open.ct <== ct;
+    // (1) ballot-commitment opening: HARD, gated by active
+    component open = Poseidon(10);
     for (var i = 0; i < 9; i++) {
-        open.pt[i] <== pt[i];
+        open.inputs[i] <== pt[i];
     }
-    open.rho <== rho;
+    open.inputs[9] <== rho;
+    active * (open.out - ct) === 0;
 
     // (2) plaintext eid matches the public one (soft)
     component eqEid = IsEqual();
@@ -168,15 +175,13 @@ template BallotValidity(depth, nCand) {
     hEq.in[0] <== hcom.out;
     hEq.in[1] <== reg_h;
 
-    // (8) conjunction
-    signal v1;
+    // (8) conjunction (opening is hard, not a flag)
     signal v2;
     signal v3;
     signal v4;
     signal v5;
     signal v6;
-    v1 <== open.ok * eqEid.out;
-    v2 <== v1 * candOk;
+    v2 <== eqEid.out * candOk;
     v3 <== v2 * sig.ok;
     v4 <== v3 * in_range;
     v5 <== v4 * vk_match;

@@ -13,7 +13,7 @@
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 
-use cr_dr::protocol::bulletin_board::BulletinBoard;
+use cr_dr::protocol::admission::admitted_from_ballots;
 use cr_dr::protocol::chaff::chaff_ballot;
 use cr_dr::protocol::fake_compliance::{build_fake_ballot, fake_compliance};
 use cr_dr::protocol::filter_and_tally::filter_and_tally;
@@ -105,13 +105,10 @@ fn main() -> anyhow::Result<()> {
             ballots.push(chaff_ballot(&pp, &mut rng)?);
         }
 
-        let mut bb = BulletinBoard::new();
-        for b in &ballots {
-            bb.append(b.public());
-        }
-        let (tally, _) = filter_and_tally(&pp, &authority, &reg, &ballots)?;
-        let statement = build_tally_statement(&pp, &bb, &reg, &tally);
-        let witness = build_tally_witness(&pp, &authority, &reg, &ballots)?;
+        let (admitted, openings) = admitted_from_ballots(&ballots);
+        let (tally, _) = filter_and_tally(&pp, &authority, &reg, &admitted, &openings)?;
+        let statement = build_tally_statement(&pp, &admitted, &reg, &tally);
+        let witness = build_tally_witness(&pp, &authority, &reg, &admitted, &openings)?;
         assert!(relation_check_native(&statement, &witness, &MEDIUM_SHAPE));
         let input = generate_witness_input(&statement, &witness, &MEDIUM_SHAPE)?;
         let dir = root.join("build/inputs");
@@ -161,13 +158,10 @@ fn write_input(
     reg: &cr_dr::protocol::preprocessing::RegistrationState,
     ballots: &[cr_dr::types::Ballot],
 ) -> anyhow::Result<()> {
-    let mut bb = BulletinBoard::new();
-    for b in ballots {
-        bb.append(b.public());
-    }
-    let (tally, _) = filter_and_tally(pp, authority, reg, ballots)?;
-    let statement = build_tally_statement(pp, &bb, reg, &tally);
-    let witness = build_tally_witness(pp, authority, reg, ballots)?;
+    let (admitted, openings) = admitted_from_ballots(ballots);
+    let (tally, _) = filter_and_tally(pp, authority, reg, &admitted, &openings)?;
+    let statement = build_tally_statement(pp, &admitted, reg, &tally);
+    let witness = build_tally_witness(pp, authority, reg, &admitted, &openings)?;
     assert!(
         relation_check_native(&statement, &witness, &SMALL_SHAPE),
         "example must satisfy the native relation"

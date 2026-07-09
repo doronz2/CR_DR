@@ -12,43 +12,52 @@
 //!   emit record r_j = (valid_j, id_j, pos_j, m_j);
 //!   then: sorted-record duplicate resolution (Strategy B) -> tally.
 
-use crate::crypto::encryption::commit_open;
-use crate::crypto::hash::{h_com, h_reg, sig_msg_hash};
+use crate::crypto::hash::{ct_commit, h_com, h_reg, sig_msg_hash};
 use crate::crypto::merkle::verify_path;
 use crate::crypto::signature::verify;
 use crate::errors::{CrDrError, Result};
-use crate::protocol::bulletin_board::BulletinBoard;
+use crate::protocol::admission::AdmittedOpenings;
+use crate::protocol::bulletin_board::AdmittedBoard;
 use crate::protocol::duplicates::{counted_flags_sorted, BallotRecord};
 use crate::protocol::preprocessing::RegistrationState;
 use crate::types::{
-    AuthorityBallotPayloads, AuthoritySecretState, Ballot, BallotPlaintext, DuplicateRule,
-    InternalBallotEvaluation, InternalBallotStatus, Nonce, PublicParams, TallyResult,
+    AuthoritySecretState, BallotPlaintext, DuplicateRule, InternalBallotEvaluation,
+    InternalBallotStatus, Nonce, PublicParams, TallyResult, F, PLAINTEXT_FIELD_LEN,
 };
 
-/// EA-side reassembly of full ballots: the public board fixes the ciphertexts
-/// (and their order), the EA's private store supplies the payloads. Because
-/// the ciphertexts come from the board itself, whatever is tallied is exactly
-/// what everyone can see posted.
-pub fn assemble_ea_ballots(
-    bb: &BulletinBoard,
-    payloads: &AuthorityBallotPayloads,
-) -> Result<Vec<Ballot>> {
-    if payloads.payloads.len() != bb.len() {
-        return Err(CrDrError::Crypto(format!(
-            "EA payload store has {} entries but the board has {} ballots",
-            payloads.payloads.len(),
-            bb.len()
-        )));
+/// The tally pipeline is ADMISSION-PATH INDEPENDENT: it consumes the
+/// admitted board BB_adm = [com_1..com_M] plus the EA-private openings
+/// store (filled by Path-1 decryption of ct_open, or by Path-2 private
+/// submissions — protocol::admission). The opening of every admitted
+/// commitment MUST open it: both admission paths guarantee this, and the
+/// tally circuit HARD-opens com, so a non-opening entry is a hard error
+/// here, never a soft-invalid ballot.
+pub fn opening_checked(
+    admitted: &AdmittedBoard,
+    openings: &AdmittedOpenings,
+    j: usize,
+) -> Result<([F; PLAINTEXT_FIELD_LEN], F)> {
+    let com = admitted
+        .coms
+        .get(j)
+        .ok_or_else(|| CrDrError::Crypto(format!("admitted index {j} out of range")))?;
+    let opening = openings
+        .openings
+        .get(j)
+        .ok_or_else(|| CrDrError::Crypto(format!("no opening for admitted index {j}")))?;
+    if opening.plaintext_fields.len() != PLAINTEXT_FIELD_LEN {
+        return Err(CrDrError::Crypto("malformed opening in EA store".into()));
     }
-    Ok(bb
-        .list_public_ballots()
-        .iter()
-        .zip(&payloads.payloads)
-        .map(|(pb, payload)| Ballot {
-            ciphertext: pb.ciphertext.clone(),
-            ea_payload: payload.clone(),
-        })
-        .collect())
+    let mut pt = [F::from(0u64); PLAINTEXT_FIELD_LEN];
+    pt.copy_from_slice(&opening.plaintext_fields);
+    if ct_commit(&pt, opening.rho) != *com {
+        return Err(CrDrError::Crypto(
+            "stored opening does not open the admitted commitment — admission is a \
+             precondition for tallying"
+                .into(),
+        ));
+    }
+    Ok((pt, opening.rho))
 }
 
 /// Outcome of the deterministic INDEXED registration check for a parsed
@@ -115,14 +124,22 @@ pub fn filter_and_tally(
     pp: &PublicParams,
     authority_secret: &AuthoritySecretState,
     registration_state: &RegistrationState,
-    ballots: &[Ballot],
+    admitted: &AdmittedBoard,
+    openings: &AdmittedOpenings,
 ) -> Result<(TallyResult, Vec<InternalBallotEvaluation>)> {
+    if admitted.len() != openings.openings.len() {
+        return Err(CrDrError::Crypto(format!(
+            "admitted board has {} commitments but the EA store has {} openings",
+            admitted.len(),
+            openings.openings.len()
+        )));
+    }
     // Stage 1: per-ballot validity (no duplicate handling here).
-    let mut statuses = Vec::with_capacity(ballots.len());
-    let mut records = Vec::with_capacity(ballots.len());
-    for (pos, ballot) in ballots.iter().enumerate() {
+    let mut statuses = Vec::with_capacity(admitted.len());
+    let mut records = Vec::with_capacity(admitted.len());
+    for pos in 0..admitted.len() {
         let (status, voter_id, candidate, cand_pos) =
-            evaluate_ballot_validity(pp, authority_secret, registration_state, ballot);
+            evaluate_ballot_validity(pp, authority_secret, registration_state, admitted, openings, pos)?;
         let valid = status == BallotValidity::Valid;
         records.push(BallotRecord {
             valid,
@@ -141,7 +158,7 @@ pub fn filter_and_tally(
     // Stage 3: tally accumulation + internal log.
     let mut counts = vec![0u64; pp.candidates.len()];
     let mut counted_ballots = 0u64;
-    let mut evaluations = Vec::with_capacity(ballots.len());
+    let mut evaluations = Vec::with_capacity(admitted.len());
     for (j, ((status, voter_id, candidate, cand_pos), record)) in
         statuses.into_iter().zip(&records).enumerate()
     {
@@ -176,42 +193,47 @@ enum BallotValidity {
 type ValidityOutcome = (BallotValidity, Option<u64>, Option<u64>, Option<usize>);
 
 /// Stages (a)-(h): everything except duplicates. Returns the verdict plus
-/// (voter_id, candidate, candidate index) when parseable.
+/// (voter_id, candidate, candidate index) when parseable. Decryption
+/// failure is a hard error (see `decrypt_entry`).
 fn evaluate_ballot_validity(
     pp: &PublicParams,
     authority_secret: &AuthoritySecretState,
     registration_state: &RegistrationState,
-    ballot: &Ballot,
-) -> ValidityOutcome {
+    admitted: &AdmittedBoard,
+    openings: &AdmittedOpenings,
+    pos: usize,
+) -> Result<ValidityOutcome> {
     use BallotValidity::Invalid;
 
-    // (a) decrypt/open
-    let opening = match commit_open(&ballot.ciphertext, &ballot.ea_payload) {
-        Ok(o) => o,
-        Err(_) => return (Invalid(InternalBallotStatus::InvalidDecryption), None, None, None),
-    };
+    // (a) the admitted commitment's opening (hard on inconsistency)
+    let (pt_fields, _r_com) = opening_checked(admitted, openings, pos)?;
 
     // (b) parse plaintext
-    let pt: BallotPlaintext = match BallotPlaintext::from_fields(&opening.plaintext_fields) {
+    let pt: BallotPlaintext = match BallotPlaintext::from_fields(&pt_fields) {
         Ok(p) => p,
-        Err(_) => return (Invalid(InternalBallotStatus::InvalidFormat), None, None, None),
+        Err(_) => return Ok((Invalid(InternalBallotStatus::InvalidFormat), None, None, None)),
     };
     let ids = (Some(pt.id), Some(pt.candidate));
 
     // (c) election id binding
     if pt.eid_hash != pp.eid_hash {
-        return (Invalid(InternalBallotStatus::InvalidFormat), ids.0, ids.1, None);
+        return Ok((Invalid(InternalBallotStatus::InvalidFormat), ids.0, ids.1, None));
     }
 
     // (d) candidate in C
     let Some(cand_pos) = pp.candidates.iter().position(|c| *c == pt.candidate) else {
-        return (Invalid(InternalBallotStatus::InvalidCandidate), ids.0, ids.1, None);
+        return Ok((Invalid(InternalBallotStatus::InvalidCandidate), ids.0, ids.1, None));
     };
 
     // (e) signature over (eid_hash, id, candidate, R)
     let msg = sig_msg_hash(pt.eid_hash, pt.id, pt.candidate, pt.r);
     if !verify(&pt.vk, msg, &pt.sigma) {
-        return (Invalid(InternalBallotStatus::InvalidSignature), ids.0, ids.1, Some(cand_pos));
+        return Ok((
+            Invalid(InternalBallotStatus::InvalidSignature),
+            ids.0,
+            ids.1,
+            Some(cand_pos),
+        ));
     }
 
     // (f)-(h) indexed registration row + hidden nonce relation. The
@@ -222,9 +244,14 @@ fn evaluate_ballot_validity(
         Err(_) => RegistrationCheck::NotRegistered,
     };
     if reg != RegistrationCheck::Ok {
-        return (Invalid(InternalBallotStatus::InvalidRegistration), ids.0, ids.1, Some(cand_pos));
+        return Ok((
+            Invalid(InternalBallotStatus::InvalidRegistration),
+            ids.0,
+            ids.1,
+            Some(cand_pos),
+        ));
     }
 
     // (i) ballot is VALID; duplicates are the caller's stage.
-    (BallotValidity::Valid, ids.0, ids.1, Some(cand_pos))
+    Ok((BallotValidity::Valid, ids.0, ids.1, Some(cand_pos)))
 }

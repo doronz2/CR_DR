@@ -1,5 +1,7 @@
 mod common;
 
+use cr_dr::protocol::admission::admitted_from_ballots;
+
 use cr_dr::protocol::chaff::chaff_ballot;
 use cr_dr::protocol::fake_compliance::{build_fake_ballot, fake_compliance};
 use cr_dr::protocol::filter_and_tally::filter_and_tally;
@@ -12,7 +14,7 @@ fn chaff_is_rejected_by_filter_and_tally() {
     for _ in 0..5 {
         ballots.push(chaff_ballot(&env.pp, &mut env.rng).unwrap());
     }
-    let (tally, evals) = filter_and_tally(&env.pp, &env.authority, &env.reg, &ballots).unwrap();
+    let (tally, evals) = { let (adm, opn) = admitted_from_ballots(&ballots); filter_and_tally(&env.pp, &env.authority, &env.reg, &adm, &opn) }.unwrap();
     assert_eq!(tally.counts, vec![0, 0, 0]);
     assert_eq!(tally.counted_ballots, 0);
     for e in &evals {
@@ -28,13 +30,13 @@ fn chaff_has_the_same_public_shape_and_rejection_class_as_fake_ballots() {
     let fake = build_fake_ballot(&env.pp, &t, &mut env.rng).unwrap();
 
     // Same public object shape.
-    assert_eq!(chaff.ciphertext.fields.len(), fake.ciphertext.fields.len());
+    assert_eq!(chaff.ct_open.masked.len(), fake.ct_open.masked.len());
     assert_eq!(chaff.bytes().len(), fake.bytes().len());
 
     // Same internal rejection class (InvalidRegistration for both), so even
     // the tallier's internal log does not separate chaff from fake ballots.
     let (_, evals) =
-        filter_and_tally(&env.pp, &env.authority, &env.reg, &[chaff, fake]).unwrap();
+        { let (adm, opn) = admitted_from_ballots(&[chaff.clone(), fake.clone()]); filter_and_tally(&env.pp, &env.authority, &env.reg, &adm, &opn) }.unwrap();
     assert_eq!(evals[0].status, InternalBallotStatus::InvalidRegistration);
     assert_eq!(evals[1].status, InternalBallotStatus::InvalidRegistration);
 }

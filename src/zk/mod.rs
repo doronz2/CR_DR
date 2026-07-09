@@ -1,3 +1,4 @@
+pub mod cast;
 pub mod chunked;
 pub mod circom_io;
 pub mod groth16_backend;

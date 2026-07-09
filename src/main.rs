@@ -12,7 +12,6 @@
 //!   public/tally.json            public tally
 //!   public/statement.json        public ZK statement
 //!   authority/secret.json        EA SECRET state (R_EA,i live here)
-//!   authority/ballot_payloads.json  EA SECRET per-ballot payloads (openings)
 //!   voters/<id>.json             per-voter SECRET state (sk_i, R_i)
 //!   channel.json                 pending anonymous-channel submissions
 //!   proofs/proof.json,public.json
@@ -29,26 +28,27 @@ use clap::{Parser, Subcommand};
 
 use cr_dr::disputes::judge::JudgeReport;
 use cr_dr::disputes::recorded_as_cast::{
-    adjudicate_recorded_as_cast, check_direct, ea_issue_receipt, verify_receipt,
+    adjudicate_admission_receipt, adjudicate_recorded_as_cast, check_direct, verify_receipt,
     SubmissionReceipt,
 };
 use cr_dr::disputes::tallied_as_recorded::{
     judge_tallied_as_recorded, AuthorityEvidence, NonceSource, TalliedAsRecordedComplaint,
     TallyProofStatus,
 };
-use cr_dr::protocol::bulletin_board::{AnonymousChannel, BulletinBoard};
+use cr_dr::protocol::admission::{clean, ea_admit_private, ea_open_admitted, AdmittedOpenings, EaAdmissionState};
+use cr_dr::protocol::bulletin_board::{AdmittedBoard, AnonymousChannel, BulletinBoard};
 use cr_dr::protocol::chaff::chaff_ballot;
 use cr_dr::protocol::fake_compliance::{
     build_fake_ballot, fake_compliance, FakeComplianceTranscript,
 };
-use cr_dr::protocol::filter_and_tally::{assemble_ea_ballots, filter_and_tally};
+use cr_dr::protocol::filter_and_tally::filter_and_tally;
 use cr_dr::protocol::preprocessing::{
     finalize_registration, preprocess_voter, preprocess_voter_cut_and_choose, RegistrationState,
 };
 use cr_dr::protocol::setup::setup_election;
 use cr_dr::protocol::vote::cast_vote;
 use cr_dr::types::{
-    AuthorityBallotPayloads, AuthoritySecretState, Ballot, DuplicateRule, ElectionConfig,
+    AuthoritySecretState, Ballot, DuplicateRule, ElectionConfig,
     PublicParams, PublicRegistrationRecord, TallyResult, ThresholdParams, VoterState,
 };
 use cr_dr::zk::circom_io::{generate_witness_input, public_inputs_match};
@@ -184,15 +184,22 @@ enum Cmd {
         ballot: PathBuf,
     },
 
-    /// [EA] Issue a submission receipt Sign_EA(eid, ballot_hash, timestamp).
-    IssueReceipt {
+    /// [voter+EA, Path 2] Private EA-mediated admission: the EA checks that
+    /// the opening opens com (admission-level ONLY) and returns
+    /// receipt = Sign_EA(eid, com, timestamp). Fake-nonce ballots receive
+    /// identical receipts (no coercion test).
+    EaSubmit {
         #[arg(long)]
         ballot: PathBuf,
         #[arg(long)]
         timestamp: u64,
         #[arg(long, default_value = "receipt.json")]
-        out: PathBuf,
+        receipt_out: PathBuf,
     },
+
+    /// [anyone, Path 1] Compute BB_adm = Clean(BB_raw): admit exactly the
+    /// raw entries whose pi_cast verifies; EA decrypts admitted openings.
+    AdmitBoard,
 
     /// [judge, private] Adjudicate a recorded-as-cast complaint.
     DisputeRecorded {
@@ -245,9 +252,6 @@ impl Paths {
     fn authority(&self) -> PathBuf {
         self.dir.join("authority/secret.json")
     }
-    fn authority_payloads(&self) -> PathBuf {
-        self.dir.join("authority/ballot_payloads.json")
-    }
     fn voter(&self, id: u64) -> PathBuf {
         self.dir.join(format!("voters/{id}.json"))
     }
@@ -259,6 +263,18 @@ impl Paths {
     }
     fn board(&self) -> PathBuf {
         self.public().join("board.json")
+    }
+
+    fn cast_proofs(&self) -> PathBuf {
+        self.dir.join("public/cast_proofs.json")
+    }
+
+    fn admitted(&self) -> PathBuf {
+        self.dir.join("public/admitted.json")
+    }
+
+    fn openings(&self) -> PathBuf {
+        self.dir.join("authority/openings.json")
     }
     fn channel(&self) -> PathBuf {
         self.dir.join("channel.json")
@@ -428,7 +444,9 @@ fn main() -> Result<()> {
         Cmd::Submit { ballot } => {
             let b: Ballot = read_json(&ballot, "ballot")?;
             let mut channel: AnonymousChannel = read_json_or_default(&paths.channel())?;
-            channel.submit(b);
+            // Only the PUBLIC entry (com, ct_open) enters the channel; the
+            // cast secret stays in the voter's ballot file.
+            channel.submit(b.public());
             write_json(&paths.channel(), &channel)?;
             println!("ballot queued in the anonymous channel (flush with `cr_dr flush-channel`)");
         }
@@ -436,22 +454,21 @@ fn main() -> Result<()> {
         Cmd::FlushChannel => {
             let mut channel: AnonymousChannel = read_json_or_default(&paths.channel())?;
             let mut board: BulletinBoard = read_json_or_default(&paths.board())?;
-            let mut payloads: AuthorityBallotPayloads =
-                read_json_or_default(&paths.authority_payloads())?;
-            let ballots = channel.flush_shuffled(&mut rng);
-            let n = ballots.len();
-            // Only the ciphertext is posted publicly; the EA payload (in
-            // commitment mode: the full opening) goes to the EA's private
-            // store, aligned with board order.
-            for b in ballots {
-                board.append(b.public());
-                payloads.payloads.push(b.ea_payload);
+            let mut proofs: Vec<Option<cr_dr::zk::cast::CastProof>> =
+                read_json_or_default(&paths.cast_proofs())?;
+            let subs = channel.flush_shuffled(&mut rng);
+            let n = subs.len();
+            // Path 1: raw entries (com, ct_open) + pi_cast land on BB_raw;
+            // admission happens explicitly via `admit-board` (Clean).
+            for sub in subs {
+                board.append(sub.entry);
+                proofs.push(sub.pi_cast);
             }
             write_json(&paths.board(), &board)?;
-            write_json(&paths.authority_payloads(), &payloads)?;
+            write_json(&paths.cast_proofs(), &proofs)?;
             write_json(&paths.channel(), &channel)?;
-            println!("{n} ballot(s) posted to the board in shuffled order (bytes preserved)");
-            println!("board now holds {} ballot(s); EA payloads stored privately", board.len());
+            println!("{n} raw submission(s) posted to BB_raw in shuffled order (bytes preserved)");
+            println!("raw board now holds {} entries; run `admit-board` to compute BB_adm", board.len());
         }
 
         Cmd::ShowBoard => {
@@ -467,16 +484,19 @@ fn main() -> Result<()> {
             let authority: AuthoritySecretState =
                 read_json(&paths.authority(), "authority secret state")?;
             let reg: RegistrationState = read_json(&paths.registration(), "registration")?;
-            let board: BulletinBoard = read_json_or_default(&paths.board())?;
-            let payloads: AuthorityBallotPayloads =
-                read_json_or_default(&paths.authority_payloads())?;
-            let full_ballots = assemble_ea_ballots(&board, &payloads)?;
-            let (tally, _internal) = filter_and_tally(&pp, &authority, &reg, &full_ballots)?;
-            let statement = build_tally_statement(&pp, &board, &reg, &tally);
+            let admitted: AdmittedBoard =
+                read_json(&paths.admitted(), "admitted board (run `admit-board` or `ea-submit`)")?;
+            let openings: AdmittedOpenings =
+                read_json(&paths.openings(), "EA openings store")?;
+            // Path-independent: the tally consumes BB_adm + the EA-private
+            // openings, however admission happened.
+            let (tally, _internal) =
+                filter_and_tally(&pp, &authority, &reg, &admitted, &openings)?;
+            let statement = build_tally_statement(&pp, &admitted, &reg, &tally);
             write_json(&paths.tally(), &tally)?;
             write_json(&paths.statement(), &statement)?;
             // ONLY public output is printed; the internal log is dropped.
-            println!("FilterAndTally over {} posted ballot(s):", board.len());
+            println!("FilterAndTally over {} admitted commitment(s):", admitted.len());
             for (c, n) in pp.candidates.iter().zip(&tally.counts) {
                 println!("  candidate {c}: {n}");
             }
@@ -489,13 +509,13 @@ fn main() -> Result<()> {
             let authority: AuthoritySecretState =
                 read_json(&paths.authority(), "authority secret state")?;
             let reg: RegistrationState = read_json(&paths.registration(), "registration")?;
-            let board: BulletinBoard = read_json_or_default(&paths.board())?;
-            let payloads: AuthorityBallotPayloads =
-                read_json_or_default(&paths.authority_payloads())?;
+            let admitted: AdmittedBoard =
+                read_json(&paths.admitted(), "admitted board (run `admit-board` or `ea-submit`)")?;
+            let openings: AdmittedOpenings =
+                read_json(&paths.openings(), "EA openings store")?;
             let statement: TallyStatement =
                 read_json(&paths.statement(), "public statement (run `tally` first)")?;
-            let full_ballots = assemble_ea_ballots(&board, &payloads)?;
-            let witness = build_tally_witness(&pp, &authority, &reg, &full_ballots)?;
+            let witness = build_tally_witness(&pp, &authority, &reg, &admitted, &openings)?;
             if !relation_check_native(&statement, &witness, &SMALL_SHAPE) {
                 bail!("native relation check failed — statement and board disagree");
             }
@@ -527,11 +547,12 @@ fn main() -> Result<()> {
             // public data -> statement -> tally -> proof public inputs.
             let pp: PublicParams = read_json(&paths.params(), "public params")?;
             let reg: RegistrationState = read_json(&paths.registration(), "registration")?;
-            let board: BulletinBoard = read_json_or_default(&paths.board())?;
+            let admitted: AdmittedBoard =
+                read_json(&paths.admitted(), "admitted board")?;
             let statement: TallyStatement =
                 read_json(&paths.statement(), "public statement (run `tally` first)")?;
             let tally: TallyResult = read_json(&paths.tally(), "public tally")?;
-            if !statement_matches_public_data(&statement, &pp, &board, &reg) {
+            if !statement_matches_public_data(&statement, &pp, &admitted, &reg) {
                 println!("INVALID: published statement does not match the public election data");
                 std::process::exit(1);
             }
@@ -563,31 +584,84 @@ fn main() -> Result<()> {
             }
         }
 
-        Cmd::IssueReceipt { ballot, timestamp, out } => {
+        Cmd::EaSubmit { ballot, timestamp, receipt_out } => {
+            // Path 2: the voter privately hands (com, opening, r_com) to the
+            // EA. Admission-level check ONLY; receipt = Sign_EA(eid, com, t).
             let pp: PublicParams = read_json(&paths.params(), "public params")?;
             let authority: AuthoritySecretState =
                 read_json(&paths.authority(), "authority secret state")?;
             let b: Ballot = read_json(&ballot, "ballot")?;
-            let receipt = ea_issue_receipt(&pp, &authority, &b, timestamp, &mut rng);
-            write_json(&out, &receipt)?;
-            println!("EA submission receipt -> {}", out.display());
+            let mut state = EaAdmissionState {
+                admitted: read_json_or_default(&paths.admitted())?,
+                openings: read_json_or_default(&paths.openings())?,
+            };
+            let receipt = ea_admit_private(
+                &pp,
+                &authority,
+                &mut state,
+                b.com,
+                b.secret.opening.clone(),
+                timestamp,
+                &mut rng,
+            )?;
+            write_json(&paths.admitted(), &state.admitted)?;
+            write_json(&paths.openings(), &state.openings)?;
+            write_json(&receipt_out, &receipt)?;
+            println!(
+                "commitment admitted (Path 2); receipt -> {} (certifies ADMISSION only)",
+                receipt_out.display()
+            );
+        }
+
+        Cmd::AdmitBoard => {
+            // Path 1: BB_adm = Clean(BB_raw); EA decrypts the admitted
+            // entries' ct_opens into its private openings store.
+            let pp: PublicParams = read_json(&paths.params(), "public params")?;
+            let authority: AuthoritySecretState =
+                read_json(&paths.authority(), "authority secret state")?;
+            let board: BulletinBoard = read_json_or_default(&paths.board())?;
+            let proofs: Vec<Option<cr_dr::zk::cast::CastProof>> =
+                read_json_or_default(&paths.cast_proofs())?;
+            let root = SnarkjsBackend::crate_root();
+            let cast_be = SnarkjsBackend {
+                root: root.clone(),
+                circuit: cr_dr::zk::cast::CAST_CIRCUIT.into(),
+            };
+            if !cast_be.toolchain_available() {
+                bail!("cast circuit artifacts missing (compile_circuits.sh cast + setup_groth16.sh cast)");
+            }
+            let (admitted, indices) = clean(&board, &proofs, |entry, proof| {
+                cr_dr::zk::cast::verify_cast_entry(&root, &pp.pk_ea, entry, proof)
+            })?;
+            let openings = ea_open_admitted(&authority, &board, &indices)?;
+            write_json(&paths.admitted(), &admitted)?;
+            write_json(&paths.openings(), &openings)?;
+            println!(
+                "Clean(BB_raw): {} of {} raw entries admitted (valid pi_cast) -> BB_adm",
+                admitted.len(),
+                board.len()
+            );
         }
 
         Cmd::DisputeRecorded { ballot, receipt } => {
             let pp: PublicParams = read_json(&paths.params(), "public params")?;
-            let board: BulletinBoard = read_json_or_default(&paths.board())?;
-            let b: Ballot = read_json(&ballot, "ballot")?;
-            let rc: Option<SubmissionReceipt> = match receipt {
+            match receipt {
                 Some(p) => {
+                    // Path 2: receipt vs the posted admitted board.
                     let r: SubmissionReceipt = read_json(&p, "receipt")?;
                     if !verify_receipt(&pp, &r) {
                         bail!("receipt signature is invalid");
                     }
-                    Some(r)
+                    let admitted: AdmittedBoard = read_json_or_default(&paths.admitted())?;
+                    print_judge_report(&adjudicate_admission_receipt(&pp, &admitted, &r));
                 }
-                None => None,
-            };
-            print_judge_report(&adjudicate_recorded_as_cast(&pp, &board, &b, rc.as_ref()));
+                None => {
+                    // Path 1: exact entry bytes on the raw board.
+                    let board: BulletinBoard = read_json_or_default(&paths.board())?;
+                    let b: Ballot = read_json(&ballot, "ballot")?;
+                    print_judge_report(&adjudicate_recorded_as_cast(&pp, &board, &b.bytes()));
+                }
+            }
         }
 
         Cmd::DisputeTally { ballot, use_threshold } => {
@@ -595,20 +669,21 @@ fn main() -> Result<()> {
             let authority: AuthoritySecretState =
                 read_json(&paths.authority(), "authority secret state")?;
             let reg: RegistrationState = read_json(&paths.registration(), "registration")?;
-            let board: BulletinBoard = read_json_or_default(&paths.board())?;
-            let payloads: AuthorityBallotPayloads =
-                read_json_or_default(&paths.authority_payloads())?;
+            let admitted: AdmittedBoard = read_json(&paths.admitted(), "admitted board")?;
+            let openings: AdmittedOpenings = read_json(&paths.openings(), "EA openings store")?;
             let b: Ballot = read_json(&ballot, "ballot")?;
 
-            // The complainant supplies the ballot + opening (here: the
-            // opening travels inside the ballot's EA payload).
-            let opening = cr_dr::crypto::encryption::commit_open(&b.ciphertext, &b.ea_payload)
-                .map_err(|_| anyhow::anyhow!("ballot does not open; complaint malformed"))?;
+            // The complainant supplies the ballot file, which carries the
+            // cast secret; the claimed opening comes from there.
+            let opening = b.secret.opening.clone();
+            anyhow::ensure!(
+                opening.plaintext_fields.len() == cr_dr::types::PLAINTEXT_FIELD_LEN,
+                "malformed opening in ballot file"
+            );
             let pt = cr_dr::types::BallotPlaintext::from_fields(&opening.plaintext_fields)?;
 
             // Judge-private evidence from the authority side.
-            let full_ballots = assemble_ea_ballots(&board, &payloads)?;
-            let (_, evals) = filter_and_tally(&pp, &authority, &reg, &full_ballots)?;
+            let (_, evals) = filter_and_tally(&pp, &authority, &reg, &admitted, &openings)?;
             let nonce_source = if use_threshold {
                 // The judge collects exactly t shares from t authorities.
                 let secret = authority
@@ -643,7 +718,7 @@ fn main() -> Result<()> {
                     read_json(&paths.statement(), "public statement")?;
                 let proof: serde_json::Value = read_json(&proof_path, "proof")?;
                 let public: serde_json::Value = read_json(&public_path, "public inputs")?;
-                if !statement_matches_public_data(&statement, &pp, &board, &reg)
+                if !statement_matches_public_data(&statement, &pp, &admitted, &reg)
                     || !public_inputs_match(&public, &statement)
                 {
                     println!("(tally proof is not bound to the current public statement)");
@@ -658,13 +733,13 @@ fn main() -> Result<()> {
                 TallyProofStatus::Unavailable
             };
 
-            let complaint = TalliedAsRecordedComplaint { ballot: b, opening };
+            let complaint = TalliedAsRecordedComplaint { com: b.com, opening };
             let evidence = AuthorityEvidence {
                 nonce_source,
                 prior_evaluations: &evals,
                 tally_proof,
             };
-            print_judge_report(&judge_tallied_as_recorded(&pp, &reg, &board, &complaint, &evidence));
+            print_judge_report(&judge_tallied_as_recorded(&pp, &reg, &admitted, &complaint, &evidence));
         }
 
         Cmd::ShareNonces { t, k } => {
@@ -732,34 +807,63 @@ fn demo() -> Result<()> {
 
     println!("voter 0 is coerced: surrenders real sk_0 + FAKE nonce, coercer demands candidate 2");
     let mut channel = AnonymousChannel::new();
+    let mut all_ballots = Vec::new();
     let coerced = &voters[0];
     let transcript = fake_compliance(&pp, coerced, 2, &mut rng)?;
-    channel.submit(build_fake_ballot(&pp, &transcript, &mut rng)?);
+    all_ballots.push(build_fake_ballot(&pp, &transcript, &mut rng)?);
     println!("voter 0 then casts the REAL vote (candidate 0) through the anonymous channel");
-    channel.submit(cast_vote(&pp, &reg, coerced, 0, &mut rng)?);
+    all_ballots.push(cast_vote(&pp, &reg, coerced, 0, &mut rng)?);
     for (voter, cand) in voters[1..].iter().zip([0u64, 1, 1, 2, 0]) {
-        channel.submit(cast_vote(&pp, &reg, voter, cand, &mut rng)?);
+        all_ballots.push(cast_vote(&pp, &reg, voter, cand, &mut rng)?);
     }
     for _ in 0..3 {
-        channel.submit(chaff_ballot(&pp, &mut rng)?);
+        all_ballots.push(chaff_ballot(&pp, &mut rng)?);
     }
 
-    // The board gets only the public parts; the EA keeps the payloads.
-    let mut bb = BulletinBoard::new();
-    let mut ea_ballots = Vec::new();
-    for ballot in channel.flush_shuffled(&mut rng) {
-        bb.append(ballot.public());
-        ea_ballots.push(ballot);
-    }
-    println!("\nbulletin board: {} ballots (6 real + 1 fake + 3 chaff, shuffled)\n", bb.len());
+    // Path 1 (public cast-ZK) when the cast artifacts exist: every ballot
+    // (real, fake, chaff alike) gets a pi_cast and BB_adm = Clean(BB_raw).
+    let root = SnarkjsBackend::crate_root();
+    let cast_be = SnarkjsBackend { root: root.clone(), circuit: cr_dr::zk::cast::CAST_CIRCUIT.into() };
+    let (admitted, openings) = if cast_be.toolchain_available() {
+        println!("admission: Path 1 (public anonymous cast-ZK) — proving pi_cast per ballot...");
+        for b in &all_ballots {
+            let proof = cr_dr::zk::cast::prove_cast(&root, &pp.pk_ea, &b.public(), &b.secret)?;
+            channel.submit_with_proof(b.public(), proof);
+        }
+        let mut bb = BulletinBoard::new();
+        let mut proofs = Vec::new();
+        for sub in channel.flush_shuffled(&mut rng) {
+            bb.append(sub.entry);
+            proofs.push(sub.pi_cast);
+        }
+        println!("raw board BB_raw: {} entries (6 real + 1 fake + 3 chaff, shuffled)", bb.len());
+        let (admitted, indices) = clean(&bb, &proofs, |entry, proof| {
+            cr_dr::zk::cast::verify_cast_entry(&root, &pp.pk_ea, entry, proof)
+        })?;
+        println!("Clean(BB_raw): {} of {} admitted (all pi_cast valid — fake/chaff pass admission)\n", admitted.len(), bb.len());
+        let openings = ea_open_admitted(&authority, &bb, &indices)?;
+        (admitted, openings)
+    } else {
+        println!("admission: Path 2 (EA-mediated private submission; cast artifacts absent)");
+        let mut state = EaAdmissionState::default();
+        for (i, b) in all_ballots.iter().enumerate() {
+            // Every ballot — fake-nonce ones included — receives the same
+            // kind of admission receipt (no coercion test).
+            let _receipt = ea_admit_private(
+                &pp, &authority, &mut state, b.com, b.secret.opening.clone(), i as u64, &mut rng,
+            )?;
+        }
+        println!("EA admitted {} commitments with receipts; BB_adm posted\n", state.admitted.len());
+        (state.admitted, state.openings)
+    };
 
     let (tally, _internal): (TallyResult, _) =
-        filter_and_tally(&pp, &authority, &reg, &ea_ballots)?;
+        filter_and_tally(&pp, &authority, &reg, &admitted, &openings)?;
     println!("public tally: candidates {:?} -> {:?} ({} counted)", pp.candidates, tally.counts, tally.counted_ballots);
     println!("  (fake + chaff rejected silently; voter 0's REAL vote counted)\n");
 
-    let statement = build_tally_statement(&pp, &bb, &reg, &tally);
-    let witness = build_tally_witness(&pp, &authority, &reg, &ea_ballots)?;
+    let statement = build_tally_statement(&pp, &admitted, &reg, &tally);
+    let witness = build_tally_witness(&pp, &authority, &reg, &admitted, &openings)?;
     let ok = relation_check_native(&statement, &witness, &SMALL_SHAPE);
     println!("native FilterAndTally relation check: {}", if ok { "ACCEPT" } else { "REJECT" });
 

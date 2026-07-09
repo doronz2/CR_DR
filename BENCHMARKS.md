@@ -5,6 +5,30 @@ witness (including authorized ≥ t reconstructions of the threshold-shared
 `R_EA,i`) and generates the Groth16 proof. **No decentralized/threshold
 proving is claimed or benchmarked.**
 
+
+> **ADMISSION PATHS.** Every benchmark documents its admission path:
+> the tally groups (`e2e_*`, `groth16_*`, `chunked`, `prove_chunked`) are
+> ADMISSION-PATH INDEPENDENT — they process an already-admitted board
+> BB_adm = [com_1..com_M] plus the EA-private openings store (the
+> `admitted_from_ballots` helper), exactly what both Path 1 (public
+> cast-ZK, BB_adm = Clean(BB_raw)) and Path 2 (EA-mediated private
+> submission with signed receipts) produce. Path-1 PER-VOTER costs are the
+> `cast` group (seal_ballot / prove_cast / verify_cast_entry). Path 2 has
+> no per-voter ZK cost; its recorded-as-cast machinery is plain
+> signatures (<1 ms).
+>
+> **FORMAT CHANGE (CAST-ZK).** The ballot format is now
+> B_j = (com, ct_open, pi_cast): real BabyJubJub-ElGamal hybrid encryption
+> of the opening on the public board, a per-ballot cast proof (6,095
+> constraints, ~50 ms rapidsnark, verified publicly BEFORE tallying), a
+> HARD commitment opening inside the tally circuit, and a SOFT-SAFE
+> Schnorr gadget (complete Edwards double-and-add). Tally circuits grew
+> ~19-20%: small 116,035 -> 140,179 (naive 139,140), medium 1,009,483 ->
+> 1,202,635, validity chunk 1,017,911 -> ~1.21M. The tables below predate
+> this change; scale proving times by ~1.2x for current circuits (the
+> measured cast-proof and updated headline numbers are in the "CAST-ZK
+> costs" section at the end).
+
 ## Environment
 
 | | |

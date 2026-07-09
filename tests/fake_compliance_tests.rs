@@ -1,5 +1,7 @@
 mod common;
 
+use cr_dr::protocol::admission::admitted_from_ballots;
+
 use cr_dr::crypto::hash::sig_msg_hash;
 use cr_dr::crypto::signature::verify;
 use cr_dr::protocol::fake_compliance::{build_fake_ballot, fake_compliance};
@@ -24,7 +26,7 @@ fn fake_ballot_is_rejected_by_filter_and_tally() {
     let mut env = common::small_election(31);
     let t = fake_compliance(&env.pp, &env.voters[0], 2, &mut env.rng).unwrap();
     let fake = build_fake_ballot(&env.pp, &t, &mut env.rng).unwrap();
-    let (tally, evals) = filter_and_tally(&env.pp, &env.authority, &env.reg, &[fake]).unwrap();
+    let (tally, evals) = { let (adm, opn) = admitted_from_ballots(&[fake.clone()]); filter_and_tally(&env.pp, &env.authority, &env.reg, &adm, &opn) }.unwrap();
     assert_eq!(tally.counts, vec![0, 0, 0]);
     // It fails exactly at the hidden nonce / registration relation.
     assert_eq!(evals[0].status, InternalBallotStatus::InvalidRegistration);
@@ -40,7 +42,7 @@ fn fake_ballot_before_real_ballot_does_not_block_the_real_one() {
     let real = cast_vote(&env.pp, &env.reg, &voter, 0, &mut env.rng).unwrap();
 
     let (tally, evals) =
-        filter_and_tally(&env.pp, &env.authority, &env.reg, &[fake, real]).unwrap();
+        { let (adm, opn) = admitted_from_ballots(&[fake.clone(), real.clone()]); filter_and_tally(&env.pp, &env.authority, &env.reg, &adm, &opn) }.unwrap();
     assert_eq!(evals[0].status, InternalBallotStatus::InvalidRegistration);
     assert_eq!(evals[1].status, InternalBallotStatus::Counted);
     // The real vote (candidate 0) counts; the coerced choice (2) does not.
@@ -54,6 +56,6 @@ fn fake_and_real_ballots_have_identical_public_shape() {
     let t = fake_compliance(&env.pp, &voter, 2, &mut env.rng).unwrap();
     let fake = build_fake_ballot(&env.pp, &t, &mut env.rng).unwrap();
     let real = cast_vote(&env.pp, &env.reg, &voter, 0, &mut env.rng).unwrap();
-    assert_eq!(fake.ciphertext.fields.len(), real.ciphertext.fields.len());
+    assert_eq!(fake.ct_open.masked.len(), real.ct_open.masked.len());
     assert_eq!(fake.bytes().len(), real.bytes().len());
 }

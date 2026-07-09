@@ -23,7 +23,8 @@ use clap::Parser;
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 
-use cr_dr::protocol::bulletin_board::{AnonymousChannel, BulletinBoard};
+use cr_dr::protocol::admission::admitted_from_ballots;
+use cr_dr::protocol::bulletin_board::AnonymousChannel;
 use cr_dr::protocol::chaff::chaff_ballot;
 use cr_dr::protocol::fake_compliance::{build_fake_ballot, fake_compliance};
 use cr_dr::protocol::preprocessing::{finalize_registration, preprocess_voter};
@@ -80,29 +81,29 @@ fn main() -> anyhow::Result<()> {
     }
     let reg = finalize_registration(&pp, &records)?;
 
-    let mut channel = AnonymousChannel::new();
+    // Ballots shuffled voter-side (the driver models an already-admitted
+    // board; admission-path costs are benchmarked separately).
+    let _ = AnonymousChannel::new();
+    let mut ballots = Vec::new();
     let n_fake = 5.min(voters.len());
     for v in voters.iter().take(n_fake) {
         let t = fake_compliance(&pp, v, 2, &mut rng)?;
-        channel.submit(build_fake_ballot(&pp, &t, &mut rng)?);
-        channel.submit(cast_vote(&pp, &reg, v, 0, &mut rng)?);
+        ballots.push(build_fake_ballot(&pp, &t, &mut rng)?);
+        ballots.push(cast_vote(&pp, &reg, v, 0, &mut rng)?);
     }
     for (i, v) in voters.iter().enumerate().skip(n_fake) {
-        channel.submit(cast_vote(&pp, &reg, v, 1 + (i as u64 % 2), &mut rng)?);
+        ballots.push(cast_vote(&pp, &reg, v, 1 + (i as u64 % 2), &mut rng)?);
     }
     for _ in (n_fake + voters.len())..args.ballots {
-        channel.submit(chaff_ballot(&pp, &mut rng)?);
+        ballots.push(chaff_ballot(&pp, &mut rng)?);
     }
-    let mut bb = BulletinBoard::new();
-    let mut ballots = Vec::new();
-    for b in channel.flush_shuffled(&mut rng) {
-        bb.append(b.public());
-        ballots.push(b);
-    }
+    use rand::seq::SliceRandom;
+    ballots.shuffle(&mut rng);
     let gen_time = t0.elapsed();
 
     let t1 = Instant::now();
-    let ct = build_chunked_tally(&pp, &authority, &reg, &ballots, &bb, CHUNK_SIZE, &mut rng)?;
+    let (admitted, openings) = admitted_from_ballots(&ballots);
+    let ct = build_chunked_tally(&pp, &authority, &reg, &admitted, &openings, CHUNK_SIZE, &mut rng)?;
     anyhow::ensure!(chunked_relation_check_native(&ct), "native chunked relation must accept");
     let build_time = t1.elapsed();
     let k = ct.k_chunks;
