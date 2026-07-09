@@ -181,9 +181,9 @@ pub fn judge_tallied_as_recorded(
              statement; cannot conclude the ballot was counted",
         ),
         TallyProofStatus::Verified => JudgeReport::new(
-            Verdict::Undetermined,
+            Verdict::NoAuthorityFault,
             "valid first ballot and a verifying tally proof: under proof soundness the ballot \
-             was counted; no fault identified",
+             was counted; no authority fault",
         ),
     }
 }

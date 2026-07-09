@@ -113,6 +113,9 @@ fn judge_detects_fake_nonce_privately() {
     // The judge privately identifies the fake nonce...
     assert_eq!(report.verdict, Verdict::VoterFaulty);
     assert!(report.detail.contains("nonce"));
+    // ...the EXTERNALLY releasable verdict is coarsened to NoAuthorityFault,
+    // so the dispute outcome cannot serve as a coercer's nonce test...
+    assert_eq!(report.external_verdict(), Verdict::NoAuthorityFault);
     // ...and the report never contains R_EA,i itself.
     assert!(!format!("{report:?}").contains(&f_to_dec(&r_ea)));
 }
@@ -134,7 +137,7 @@ fn judge_accepts_valid_first_ballot_with_verifying_proof() {
         tally_proof: TallyProofStatus::Verified,
     };
     let report = judge_tallied_as_recorded(&env.pp, &env.reg, &adm, &complaint, &evidence);
-    assert_eq!(report.verdict, Verdict::Undetermined); // counted under proof soundness
+    assert_eq!(report.verdict, Verdict::NoAuthorityFault); // counted under proof soundness
 }
 
 #[test]
@@ -201,7 +204,7 @@ fn judge_works_with_threshold_share_reconstruction() {
         tally_proof: TallyProofStatus::Verified,
     };
     let report = judge_tallied_as_recorded(&env.pp, &env.reg, &adm, &complaint, &evidence);
-    assert_eq!(report.verdict, Verdict::Undetermined); // valid + counted
+    assert_eq!(report.verdict, Verdict::NoAuthorityFault); // valid + counted
 }
 
 #[test]
