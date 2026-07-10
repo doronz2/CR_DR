@@ -415,22 +415,48 @@ malicious VSS/DKG.**
 
 ## 8. Private dispute resolution
 
-* **Recorded-as-cast.** The anonymous channel preserves exact bytes, so a
-  voter privately checks `BB.contains_exact_bytes(ballot.bytes())` (bytes
-  are derived from the posted ciphertext, never stored separately)
-  (`check-recorded`). This is optional for coercion resistance — if a
-  coercer demands to see a ballot, the voter shows the *fake* one. With an
-  EA submission receipt `Sign_EA(eid, ballot_hash, timestamp)`, a missing
-  ballot becomes attributable: valid receipt + absent bytes ⇒ `BoardFaulty`.
-* **Tallied-as-recorded.** The judge privately receives the ballot opening,
-  claimed `R_i`, signature, Merkle path — and `R_EA,i`, either from the EA
-  or reconstructed from ≥ t threshold shares. It re-runs the validity
-  checks and the duplicate rule and checks the public tally proof against
-  the current statement (`TallyProofStatus`): an invalid proof ⇒
+* **Recorded-as-cast (Path 1, public cast-ZK).** A raw submission is
+  `(com, ct_open, pi_cast)`, and byte presence alone is NOT admission:
+  `Clean(BB_raw)` keeps an entry only if a verifying `pi_cast` accompanies
+  it. The voter's check (`check-recorded`) and the adjudication
+  (`dispute-recorded` without a receipt) are therefore PROOF-AWARE: they
+  look for the exact entry bytes on `BB_raw` **and** a verifying `pi_cast`
+  at a matching index. Entry present + verifying proof ⇒ admitted,
+  complaint unfounded (`VoterFaulty` internally). Entry present but proof
+  missing/invalid ⇒ `Undetermined` — Clean drops the entry, and the
+  channel model carries no acknowledgments, so a stripped proof is not
+  attributable. Entirely absent ⇒ `Undetermined` for the same reason.
+  Checking is optional for coercion resistance — if a coercer demands to
+  see a ballot, the voter shows the *fake* one.
+* **Recorded-as-cast (Path 2, EA-mediated).** The EA's admission receipt
+  `Sign_EA(eid, com, timestamp)` certifies ADMISSION ONLY (fake-nonce
+  ballots get identical receipts). A valid receipt whose commitment is
+  absent from the posted `BB_adm` ⇒ `AuthorityFaulty` (the EA posts the
+  board in this model; with a distinct board operator it would be
+  `BoardFaulty`).
+* **Tallied-as-recorded.** The judge privately receives the complainant's
+  ballot opening and `R_EA,i` — either from the EA or reconstructed from
+  ≥ t threshold shares — plus the EA-private openings store for the
+  admitted board. It re-runs the validity checks itself and RECOMPUTES the
+  duplicate rule from the openings (never trusting authority-computed
+  validity labels): commitment binding forces each supplied opening to be
+  THE opening of its admitted commitment, so a fabricated prior opening ⇒
+  `AuthorityFaulty`. **Evidence-incompleteness policy:** if the authority
+  supplies fewer prior openings than the board requires, the verdict is
+  `Undetermined`, not `AuthorityFaulty` — non-cooperation is not
+  cryptographically attributable in this model; a deployment may layer an
+  administrative rule (failure to produce evidence when summoned counts as
+  fault) on top. The judge also checks the public tally proof against the
+  current statement (`TallyProofStatus`): an invalid proof ⇒
   `AuthorityFaulty`; a missing/uncheckable proof is `Unavailable` and the
-  complaint stays `Undetermined` — the judge never assumes a proof verifies.
+  complaint stays `Undetermined` — the judge never assumes a proof
+  verifies; a valid first ballot with a verifying proof ⇒
+  `NoAuthorityFault`.
   Verdicts: `AuthorityFaulty` / `VoterFaulty` / `BoardFaulty` /
-  `Undetermined`. A fake nonce is detected here **privately** — the voter
+  `NoAuthorityFault` / `Undetermined`; externally released verdicts are
+  coarsened (`JudgeReport::external_verdict`): `VoterFaulty` ⇒
+  `NoAuthorityFault`, so a dispute outcome can never serve as a coercer's
+  nonce test. A fake nonce is detected here **privately** — the voter
   never learns `R_EA,i`, so nothing transferable is created.
 
 Leakage discipline: the voter and the public never receive `R_EA,i`;
@@ -522,7 +548,7 @@ receipt in a coercer's hands; it needs a separate treatment.
 | `components/duplicate_sorted.circom` | `DuplicateTallySorted(nB, nC)` — Strategy B (MAIN): sort records, `counted_j = valid_sorted_j·(1 − same_id_prev)`, then `tally_counts[c] === Σ counted_j·[m_j = c]`. Sorted order stays private. |
 | `components/tally_accumulator.circom` | `TallyAccumulator(nB, nC)` — sums `counted·candSel` per candidate and constrains equality with the public `tally_counts`. |
 | `main/filter_and_tally.circom` | `FilterAndTally(nB, nC, depth, dupStrategy)` — the whole relation: duplicate-rule pin, candidate-set commitment opening, `num_ballots` range + active flags, per-ballot validity, the BB Poseidon-chain binding, duplicates, tally. |
-| `main/filter_and_tally_{small,medium}.circom` (+ `_naive`) | Instantiations of `FilterAndTally(nB, nC, depth, dupStrategy)`: small = (16,3,4) — 116,035 constraints (B) / 114,996 (A-naive); medium = (128,3,6) — 1,009,483 (B) / 1,008,548 (A). Public-input list declared here. |
+| `main/filter_and_tally_{small,medium}.circom` (+ `_naive`) | Instantiations of `FilterAndTally(nB, nC, depth, dupStrategy)`: small = (16,3,4) — 144,339 constraints (B) / 143,300 (A-naive); medium = (128,3,6) — 1,235,915 (B) / 1,234,980 (A). Public-input list declared here. |
 | `input_examples/*.json` | Ready-to-prove inputs: `small_valid_input.json` (real + fake + chaff) and `fake_before_real_input.json` (the critical invariant, provable). |
 
 ### `scripts/` — ZK toolchain
@@ -569,9 +595,12 @@ receipt in a coercer's hands; it needs a separate treatment.
   (`168700·x² + y² = 1 + 168696·x²y²`); arithmetic maps internally to
   arkworks' isomorphic `a = 1` form (`x_ark = √168700 · x_circom`).
 * The signature is Schnorr over BabyJubJub with a Poseidon challenge,
-  verified in-circuit with circomlib's `escalarmulany`/`escalarmulfix`/
-  `babyjub` gadgets and the standard `Base8` generator — the native
-  verifier and the circuit implement the identical equation.
+  verified in-circuit by a SOFT-SAFE gadget: soft on-curve flags, off-curve
+  inputs muxed to `Base8`, a complete Edwards double-and-add for `c·A`
+  (circomlib's Montgomery-ladder `escalarmulany` is unsatisfiable on
+  torsion inputs), `escalarmulfix` for `S·Base8`, and a soft S-canonicity
+  flag (`S < l`) matching the native verifier's rule — the native verifier
+  and the circuit agree on every input (see `tests/soft_safety_tests.rs`).
 * Poseidon arities double as (weak) domain separation between `H_com` (6),
   `H_reg` (5), the signature message hash (4) and the ciphertext
   commitment (10); production needs explicit domain tags.
@@ -580,13 +609,25 @@ receipt in a coercer's hands; it needs a separate treatment.
 
 ## 11. Known limitations (summary)
 
-1. Commitment-mode "encryption" is not PKE (loud warning above).
-2. Dev-only Groth16 setup; no ceremony.
-3. Cut-and-choose models the audit intuition, not a malicious VSS/DKG.
-4. The anonymous channel and EA payload channel are idealized models.
-5. Weak (arity-based) Poseidon domain separation.
-6. O(B²) in-circuit duplicate check — fine at 16–128 ballots; sorted-witness
-   strategy stubbed for scaling.
-7. Cast-as-intended out of scope (receipt-freeness hazard).
-8. Groth16 proving assumes the small circuit shape; boards larger than the
-   compiled `NUM_BALLOTS` need the medium/larger variant.
+1. Dev-only Groth16 setup; no ceremony (Hermez ptau + local phase-2).
+2. Cut-and-choose models the audit intuition, not a malicious VSS/DKG.
+3. The anonymous channel and EA payload channel are idealized models.
+4. Weak (arity-based) Poseidon domain separation.
+5. **Identities are effectively 8-bit in the real relation** — every
+   compiled circuit (monolithic and chunked) range-checks ids and
+   `num_voters` to 8 bits, capping registration at 256 voters. This is
+   THE next scalability gap: the measured N=10^4 result is a
+   10^4-BOARD result over ≤ 64 registered voters (honestly labeled in
+   BENCHMARKS.md); a true 10^4-registered-voter proof needs the id width
+   parameterized to ≥ 14 bits plus a depth-14 registration tree (the
+   depth-only variant is compiled for sizing: +19.9% constraints; the
+   id-width change is estimated < 1%).
+6. Cast-as-intended out of scope (receipt-freeness hazard).
+7. Groth16 proving requires the election parameters to match a compiled
+   circuit variant exactly (small: 16 slots/depth 4, medium: 128
+   slots/depth 6; boards beyond that use the chunked pipeline). The CLI
+   resolves the variant from the parameters and rejects unmatched
+   setups.
+8. Tally-dispute evidence-incompleteness policy: an authority that
+   supplies too few prior openings yields `Undetermined`, not
+   `AuthorityFaulty` (see §8).

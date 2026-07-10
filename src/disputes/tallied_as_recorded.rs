@@ -164,6 +164,13 @@ pub fn judge_tallied_as_recorded(
     // authority-computed labels). Only prior ballots claiming the SAME
     // identity can precede this one under FirstValidCounts, and their
     // validity is deterministic given r_ea for that identity.
+    // EVIDENCE-INCOMPLETENESS POLICY: an openings store that does not
+    // cover the prior slots yields Undetermined, NOT AuthorityFaulty —
+    // non-cooperation is not cryptographically attributable in this model
+    // (unlike a fabricated opening below, which binding attributes). A
+    // deployment may layer an administrative rule on top (failure to
+    // produce evidence when summoned counts as fault); see README §8 and
+    // the paper's dispute-resolution section.
     if evidence.openings.openings.len() < board_index {
         return JudgeReport::new(
             Verdict::Undetermined,

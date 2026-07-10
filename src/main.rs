@@ -626,15 +626,63 @@ fn main() -> Result<()> {
         }
 
         Cmd::CheckRecorded { ballot } => {
+            // Presence on BB_raw is NOT admission: Clean keeps an entry
+            // only if a verifying pi_cast accompanies it, so this check is
+            // proof-aware (mirroring `dispute-recorded` adjudication).
             let board: BulletinBoard = read_json_or_default(&paths.board())?;
+            let proofs: Vec<Option<cr_dr::zk::cast::CastProof>> =
+                read_json_or_default(&paths.cast_proofs())?;
             let b: Ballot = read_json(&ballot, "ballot")?;
-            if check_direct(&board, &b.bytes()) {
-                println!("RECORDED: exact ballot bytes are on the board");
-                println!("(keep this result private — never show the real ballot to a coercer)");
-            } else {
-                println!("NOT RECORDED: ballot bytes not found on the board");
+            let bytes = b.bytes();
+            let entries = board.list_public_ballots();
+            let matches: Vec<usize> = entries
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| e.bytes() == bytes)
+                .map(|(i, _)| i)
+                .collect();
+            if matches.is_empty() {
+                debug_assert!(!check_direct(&board, &bytes));
+                println!("NOT RECORDED: ballot bytes not found on the raw board");
                 std::process::exit(1);
             }
+            let pp: PublicParams = read_json(&paths.params(), "public params")?;
+            let root = SnarkjsBackend::crate_root();
+            let cast_be = SnarkjsBackend {
+                root: root.clone(),
+                circuit: cr_dr::zk::cast::CAST_CIRCUIT.into(),
+            };
+            if !cast_be.toolchain_available() {
+                println!("PRESENT: exact ballot bytes are on the raw board");
+                println!(
+                    "WARNING: pi_cast NOT checked (cast artifacts missing) — byte presence \
+                     alone does NOT imply admission; Clean drops entries without a \
+                     verifying pi_cast"
+                );
+            } else {
+                let mut admitted = false;
+                for &i in &matches {
+                    if let Some(Some(proof)) = proofs.get(i) {
+                        if cr_dr::zk::cast::verify_cast_entry(&root, &pp.pk_ea, &entries[i], proof)? {
+                            admitted = true;
+                            break;
+                        }
+                    }
+                }
+                if admitted {
+                    println!(
+                        "RECORDED: exact ballot bytes are on the raw board with a verifying \
+                         pi_cast (public Clean admits this entry into BB_adm)"
+                    );
+                } else {
+                    println!(
+                        "PRESENT BUT NOT ADMISSIBLE: entry bytes found, but no verifying \
+                         pi_cast accompanies them — Clean will drop this entry"
+                    );
+                    std::process::exit(1);
+                }
+            }
+            println!("(keep this result private — never show the real ballot to a coercer)");
         }
 
         Cmd::EaSubmit { ballot, timestamp, receipt_out } => {

@@ -46,6 +46,18 @@ the `d137a71` checkpoint:
   election parameters and reject unmatched setups instead of silently
   using the small circuit. Suite: **131 passed / 0 failed**.
 
+* **Second review round (2026-07-10)**: `check-recorded` is now
+  PROOF-AWARE (RECORDED with verifying pi_cast / PRESENT BUT NOT
+  ADMISSIBLE / NOT RECORDED — mirrors dispute adjudication); README §8
+  rewritten for the proof-aware recorded-as-cast semantics and the
+  five-verdict model; README §11 known-limitations de-staled (O(B²)
+  duplicate wording, small-shape assumption, dangling not-PKE warning,
+  pre-soft-safe gadget description) and now names the 8-bit identity
+  width as THE next scalability gap; the tally-dispute
+  evidence-incompleteness policy (missing prior openings ⇒ Undetermined,
+  not AuthorityFaulty; fabricated openings ⇒ AuthorityFaulty) is stated
+  explicitly in code docs, README §8, and the paper's dispute model.
+
 The original checkpoint snapshot follows (historical).
 
 ---
