@@ -13,7 +13,6 @@ use cr_dr::disputes::tallied_as_recorded::{
 };
 use cr_dr::protocol::bulletin_board::BulletinBoard;
 use cr_dr::protocol::fake_compliance::{build_fake_ballot, fake_compliance};
-use cr_dr::protocol::filter_and_tally::filter_and_tally;
 use cr_dr::protocol::vote::cast_vote;
 use cr_dr::threshold::trusted_dealer::share_all_nonces;
 use cr_dr::types::{f_to_dec, ThresholdParams};
@@ -25,6 +24,56 @@ fn recorded_as_cast_succeeds_when_bytes_present() {
     let mut bb = BulletinBoard::new();
     bb.append(ballot.public());
     assert!(check_direct(&bb, &ballot.bytes()));
+
+    // Adjudication needs MORE than byte presence: the accompanying
+    // pi_cast must verify (Clean drops proofless entries).
+    let dummy = cr_dr::zk::cast::CastProof {
+        proof: serde_json::Value::Null,
+        public: serde_json::Value::Null,
+    };
+    let proofs = vec![Some(dummy)];
+    let report =
+        adjudicate_recorded_as_cast(&env.pp, &bb, &proofs, &ballot.bytes(), |_, _| Ok(true))
+            .unwrap();
+    assert_eq!(report.verdict, Verdict::VoterFaulty); // present + admitted => unfounded
+}
+
+#[test]
+fn recorded_as_cast_entry_without_verifying_proof_is_not_present() {
+    // The reviewer scenario: the entry bytes are on BB_raw but the proof
+    // is missing/tampered, so Clean drops the entry — adjudication must
+    // NOT report it as recorded.
+    let mut env = common::small_election(89);
+    let ballot = cast_vote(&env.pp, &env.reg, &env.voters[0], 0, &mut env.rng).unwrap();
+    let mut bb = BulletinBoard::new();
+    bb.append(ballot.public());
+
+    // proof missing entirely
+    let report = adjudicate_recorded_as_cast(
+        &env.pp,
+        &bb,
+        &[None],
+        &ballot.bytes(),
+        |_, _| Ok(true),
+    )
+    .unwrap();
+    assert_eq!(report.verdict, Verdict::Undetermined);
+    assert!(report.detail.contains("no verifying pi_cast"));
+
+    // proof present but failing verification (tampered)
+    let dummy = cr_dr::zk::cast::CastProof {
+        proof: serde_json::Value::Null,
+        public: serde_json::Value::Null,
+    };
+    let report = adjudicate_recorded_as_cast(
+        &env.pp,
+        &bb,
+        &[Some(dummy)],
+        &ballot.bytes(),
+        |_, _| Ok(false),
+    )
+    .unwrap();
+    assert_eq!(report.verdict, Verdict::Undetermined);
 }
 
 #[test]
@@ -33,8 +82,10 @@ fn recorded_as_cast_fails_when_absent_without_receipt() {
     let ballot = cast_vote(&env.pp, &env.reg, &env.voters[0], 0, &mut env.rng).unwrap();
     let bb = BulletinBoard::new(); // ballot never posted
     assert!(!check_direct(&bb, &ballot.bytes()));
-    let report = adjudicate_recorded_as_cast(&env.pp, &bb, &ballot.bytes());
+    let report =
+        adjudicate_recorded_as_cast(&env.pp, &bb, &[], &ballot.bytes(), |_, _| Ok(true)).unwrap();
     assert_eq!(report.verdict, Verdict::Undetermined);
+    assert!(report.detail.contains("entry absent"));
 }
 
 #[test]
@@ -98,15 +149,13 @@ fn judge_detects_fake_nonce_privately() {
     let t = fake_compliance(&env.pp, &coerced, 2, &mut env.rng).unwrap();
     let fake = build_fake_ballot(&env.pp, &t, &mut env.rng).unwrap();
     let (adm, opn) = admitted_from_ballots(&[fake.clone()]);
-    let (_, evals) =
-        filter_and_tally(&env.pp, &env.authority, &env.reg, &adm, &opn).unwrap();
 
     let opening = fake.secret.opening.clone();
     let complaint = TalliedAsRecordedComplaint { com: fake.com, opening };
     let r_ea = env.authority.r_ea(coerced.id).unwrap();
     let evidence = AuthorityEvidence {
         nonce_source: NonceSource::Direct(r_ea),
-        prior_evaluations: &evals,
+        openings: &opn,
         tally_proof: TallyProofStatus::Verified,
     };
     let report = judge_tallied_as_recorded(&env.pp, &env.reg, &adm, &complaint, &evidence);
@@ -126,14 +175,12 @@ fn judge_accepts_valid_first_ballot_with_verifying_proof() {
     let voter = env.voters[0].clone();
     let real = cast_vote(&env.pp, &env.reg, &voter, 0, &mut env.rng).unwrap();
     let (adm, opn) = admitted_from_ballots(&[real.clone()]);
-    let (_, evals) =
-        filter_and_tally(&env.pp, &env.authority, &env.reg, &adm, &opn).unwrap();
 
     let opening = real.secret.opening.clone();
     let complaint = TalliedAsRecordedComplaint { com: real.com, opening };
     let evidence = AuthorityEvidence {
         nonce_source: NonceSource::Direct(env.authority.r_ea(voter.id).unwrap()),
-        prior_evaluations: &evals,
+        openings: &opn,
         tally_proof: TallyProofStatus::Verified,
     };
     let report = judge_tallied_as_recorded(&env.pp, &env.reg, &adm, &complaint, &evidence);
@@ -146,14 +193,12 @@ fn judge_blames_authority_when_tally_proof_fails() {
     let voter = env.voters[0].clone();
     let real = cast_vote(&env.pp, &env.reg, &voter, 0, &mut env.rng).unwrap();
     let (adm, opn) = admitted_from_ballots(&[real.clone()]);
-    let (_, evals) =
-        filter_and_tally(&env.pp, &env.authority, &env.reg, &adm, &opn).unwrap();
 
     let opening = real.secret.opening.clone();
     let complaint = TalliedAsRecordedComplaint { com: real.com, opening };
     let evidence = AuthorityEvidence {
         nonce_source: NonceSource::Direct(env.authority.r_ea(voter.id).unwrap()),
-        prior_evaluations: &evals,
+        openings: &opn,
         tally_proof: TallyProofStatus::Invalid,
     };
     let report = judge_tallied_as_recorded(&env.pp, &env.reg, &adm, &complaint, &evidence);
@@ -169,14 +214,12 @@ fn judge_does_not_assume_missing_tally_proof_verifies() {
     let voter = env.voters[0].clone();
     let real = cast_vote(&env.pp, &env.reg, &voter, 0, &mut env.rng).unwrap();
     let (adm, opn) = admitted_from_ballots(&[real.clone()]);
-    let (_, evals) =
-        filter_and_tally(&env.pp, &env.authority, &env.reg, &adm, &opn).unwrap();
 
     let opening = real.secret.opening.clone();
     let complaint = TalliedAsRecordedComplaint { com: real.com, opening };
     let evidence = AuthorityEvidence {
         nonce_source: NonceSource::Direct(env.authority.r_ea(voter.id).unwrap()),
-        prior_evaluations: &evals,
+        openings: &opn,
         tally_proof: TallyProofStatus::Unavailable,
     };
     let report = judge_tallied_as_recorded(&env.pp, &env.reg, &adm, &complaint, &evidence);
@@ -191,8 +234,6 @@ fn judge_works_with_threshold_share_reconstruction() {
     let voter = env.voters[0].clone();
     let real = cast_vote(&env.pp, &env.reg, &voter, 1, &mut env.rng).unwrap();
     let (adm, opn) = admitted_from_ballots(&[real.clone()]);
-    let (_, evals) =
-        filter_and_tally(&env.pp, &env.authority, &env.reg, &adm, &opn).unwrap();
 
     // Judge receives t = 3 shares (not the nonce itself, and not from the voter).
     let shares = env.authority.voter_secrets[&voter.id].r_ea_shares[0..3].to_vec();
@@ -200,11 +241,37 @@ fn judge_works_with_threshold_share_reconstruction() {
     let complaint = TalliedAsRecordedComplaint { com: real.com, opening };
     let evidence = AuthorityEvidence {
         nonce_source: NonceSource::ThresholdShares(shares),
-        prior_evaluations: &evals,
+        openings: &opn,
         tally_proof: TallyProofStatus::Verified,
     };
     let report = judge_tallied_as_recorded(&env.pp, &env.reg, &adm, &complaint, &evidence);
     assert_eq!(report.verdict, Verdict::NoAuthorityFault); // valid + counted
+}
+
+#[test]
+fn judge_rejects_fabricated_prior_opening() {
+    // Fault-soundness hardening: the judge RECOMPUTES the duplicate
+    // predicate from the openings store; a lying authority that hands the
+    // judge a wrong opening for a prior slot (e.g. to hide an earlier
+    // valid ballot) is caught by commitment binding.
+    let mut env = common::small_election(101);
+    let voter = env.voters[0].clone();
+    let b1 = cast_vote(&env.pp, &env.reg, &voter, 0, &mut env.rng).unwrap();
+    let b2 = cast_vote(&env.pp, &env.reg, &voter, 2, &mut env.rng).unwrap();
+    let (adm, mut opn) = admitted_from_ballots(&[b1, b2.clone()]);
+    // authority "loses" the true opening of slot 0 and substitutes garbage
+    opn.openings[0].rho += cr_dr::types::F::from(1u64);
+
+    let complaint =
+        TalliedAsRecordedComplaint { com: b2.com, opening: b2.secret.opening.clone() };
+    let evidence = AuthorityEvidence {
+        nonce_source: NonceSource::Direct(env.authority.r_ea(voter.id).unwrap()),
+        openings: &opn,
+        tally_proof: TallyProofStatus::Verified,
+    };
+    let report = judge_tallied_as_recorded(&env.pp, &env.reg, &adm, &complaint, &evidence);
+    assert_eq!(report.verdict, Verdict::AuthorityFaulty);
+    assert!(report.detail.contains("does not open"));
 }
 
 #[test]
@@ -214,14 +281,12 @@ fn judge_flags_duplicate_complaints_correctly() {
     let b1 = cast_vote(&env.pp, &env.reg, &voter, 0, &mut env.rng).unwrap();
     let b2 = cast_vote(&env.pp, &env.reg, &voter, 2, &mut env.rng).unwrap();
     let (adm, opn) = admitted_from_ballots(&[b1.clone(), b2.clone()]);
-    let (_, evals) =
-        filter_and_tally(&env.pp, &env.authority, &env.reg, &adm, &opn).unwrap();
 
     let opening = b2.secret.opening.clone();
     let complaint = TalliedAsRecordedComplaint { com: b2.com, opening };
     let evidence = AuthorityEvidence {
         nonce_source: NonceSource::Direct(env.authority.r_ea(voter.id).unwrap()),
-        prior_evaluations: &evals,
+        openings: &opn,
         tally_proof: TallyProofStatus::Verified,
     };
     let report = judge_tallied_as_recorded(&env.pp, &env.reg, &adm, &complaint, &evidence);

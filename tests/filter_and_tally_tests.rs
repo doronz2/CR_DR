@@ -46,7 +46,7 @@ fn inconsistent_entry_is_a_hard_error_not_soft_invalid() {
 
 #[test]
 fn invalid_candidate_rejected() {
-    let mut env = common::small_election(51);
+    let env = common::small_election(51);
     let voter = env.voters[0].clone();
     let mut rng = env.rng.clone();
     let pt = signed_plaintext(&env, &voter, 99, voter.r, &mut rng); // 99 not in C
@@ -57,7 +57,7 @@ fn invalid_candidate_rejected() {
 
 #[test]
 fn invalid_signature_rejected() {
-    let mut env = common::small_election(52);
+    let env = common::small_election(52);
     let voter = env.voters[0].clone();
     let mut rng = env.rng.clone();
     let mut pt = signed_plaintext(&env, &voter, 1, voter.r, &mut rng);
@@ -69,7 +69,7 @@ fn invalid_signature_rejected() {
 
 #[test]
 fn signature_by_wrong_key_rejected() {
-    let mut env = common::small_election(53);
+    let env = common::small_election(53);
     let voter0 = env.voters[0].clone();
     let voter1 = env.voters[1].clone();
     let mut rng = env.rng.clone();
@@ -90,7 +90,7 @@ fn signature_by_wrong_key_rejected() {
 
 #[test]
 fn wrong_nonce_rejected_as_invalid_registration() {
-    let mut env = common::small_election(54);
+    let env = common::small_election(54);
     let voter = env.voters[0].clone();
     let mut rng = env.rng.clone();
     let wrong_r = F::rand(&mut rng);
@@ -102,7 +102,7 @@ fn wrong_nonce_rejected_as_invalid_registration() {
 
 #[test]
 fn wrong_eid_rejected_as_invalid_format() {
-    let mut env = common::small_election(55);
+    let env = common::small_election(55);
     let voter = env.voters[0].clone();
     let mut rng = env.rng.clone();
     let mut pt = signed_plaintext(&env, &voter, 1, voter.r, &mut rng);

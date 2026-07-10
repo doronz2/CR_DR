@@ -30,6 +30,22 @@ the `d137a71` checkpoint:
   circuits; the two previously-estimated cast numbers are now measured
   (seal 0.62 ms, prove_cast 135 ms, verify 208 ms).
 
+* **External review round (2026-07-10)**: five verified findings fixed —
+  (1) CLI `submit` now generates and attaches pi_cast (proofless Path-1
+  submissions were unconditionally dropped by Clean; verified end-to-end:
+  submit -> flush -> admit-board admits 2/2 -> tally -> prove -> verify);
+  (2) the d14 sizing variant is honestly labeled DEPTH-ONLY (identities
+  remain 8-bit everywhere; a 10^4-registered-voter circuit is NOT yet
+  implemented — the measured result is a 10^4-BOARD result);
+  (3) the tallied-as-recorded judge RECOMPUTES the duplicate predicate
+  from the EA openings store instead of trusting authority-supplied
+  evaluations (fabricated prior opening -> AuthorityFaulty, tested);
+  (4) Path-1 recorded-as-cast adjudication now requires a VERIFYING
+  pi_cast at the matching board index, not just entry bytes;
+  (5) CLI prove/verify/dispute resolve the circuit shape from the
+  election parameters and reject unmatched setups instead of silently
+  using the small circuit. Suite: **131 passed / 0 failed**.
+
 The original checkpoint snapshot follows (historical).
 
 ---

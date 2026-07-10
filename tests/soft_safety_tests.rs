@@ -94,7 +94,7 @@ fn assert_no_dos(mut env: common::Env, poisoned: BallotPlaintext, expected_statu
 
 #[test]
 fn off_curve_vk_does_not_dos_tally() {
-    let mut env = common::small_election(90);
+    let env = common::small_election(90);
     let voter = env.voters[0].clone();
     let mut rng = env.rng.clone();
     let mut pt = signed_plaintext(&env, &voter, 1, &mut rng);
@@ -104,7 +104,7 @@ fn off_curve_vk_does_not_dos_tally() {
 
 #[test]
 fn off_curve_sig_r_does_not_dos_tally() {
-    let mut env = common::small_election(91);
+    let env = common::small_election(91);
     let voter = env.voters[0].clone();
     let mut rng = env.rng.clone();
     let mut pt = signed_plaintext(&env, &voter, 1, &mut rng);
@@ -115,7 +115,7 @@ fn off_curve_sig_r_does_not_dos_tally() {
 
 #[test]
 fn oversized_sig_s_does_not_dos_tally() {
-    let mut env = common::small_election(92);
+    let env = common::small_election(92);
     let voter = env.voters[0].clone();
     let mut rng = env.rng.clone();
     let mut pt = signed_plaintext(&env, &voter, 1, &mut rng);

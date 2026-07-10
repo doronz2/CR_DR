@@ -259,13 +259,19 @@ Measured results:
 The compiled chunk circuits index a DEPTH-6 registration tree (<= 64
 voters, 8-bit ids): the measured run exercises the true 10^4-scale BOARD
 (the cost driver — K = B/128 chunk proofs) with 64 distinct registered
-voters. A real 10^4-voter electorate needs a depth-14 tree and 14-bit
-ids. We compiled that variant to size it exactly:
-`filter_and_tally_vchunk128_d14` = **1,493,181 constraints** = 1.199x the
-depth-6 chunk (the id-width change adds only ~6 bits per sort-key
-comparator, negligible). All projections below therefore apply a
-**x1.2 factor**; the measured 10^4 row itself would be ~17 min instead of
-~14 min on the widened circuits.
+voters. **It is a 10^4-BOARD result, not yet a 10^4-registered-voter
+proof.** A real 10^4-voter electorate needs (a) a depth-14 registration
+tree and (b) the identity width parameterized from 8 to >= 14 bits.
+Neither widened circuit is a working artifact yet: we compiled a
+DEPTH-ONLY sizing variant, `filter_and_tally_vchunk128_d14` =
+**1,493,181 constraints** = 1.199x the depth-6 chunk, which prices (a),
+the dominant term (8 extra Merkle levels per slot). The id-width change
+(b) is NOT in that variant — identities remain 8-bit in every compiled
+circuit (BallotValidity in-range check, sort-key packing, num_voters
+range checks, and the native checker's num_voters < 256 guard); widening
+it adds a few comparator bits per slot, estimated < 1%. All projections
+below therefore apply a **x1.2 factor**; the measured 10^4 row itself
+would be ~17 min instead of ~14 min on the widened circuits.
 
 ### Measured 10^4 vs projected 10^5 / 10^6
 

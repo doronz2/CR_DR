@@ -16,7 +16,7 @@ use crate::disputes::judge::{JudgeReport, Verdict};
 use crate::protocol::bulletin_board::AdmittedBoard;
 use crate::protocol::filter_and_tally::{registration_check, RegistrationCheck};
 use crate::protocol::preprocessing::RegistrationState;
-use crate::types::{BallotPlaintext, F, InternalBallotStatus, PublicParams, PLAINTEXT_FIELD_LEN};
+use crate::types::{BallotPlaintext, F, PublicParams, PLAINTEXT_FIELD_LEN};
 
 /// How the judge obtains R_EA,i.
 #[derive(Debug, Clone)]
@@ -55,9 +55,14 @@ pub enum TallyProofStatus {
 /// Evidence the judge obtains from the authority side.
 pub struct AuthorityEvidence<'a> {
     pub nonce_source: NonceSource,
-    /// Internal evaluations of the ballots preceding the complained ballot
-    /// on the board (judge-private; needed for duplicate adjudication).
-    pub prior_evaluations: &'a [crate::types::InternalBallotEvaluation],
+    /// EA-private openings aligned with the admitted board (judge-private,
+    /// never released). The judge RECOMPUTES the duplicate predicate from
+    /// these — it does NOT accept authority-computed validity labels as
+    /// evidence, so a lying authority cannot steer the duplicate verdict:
+    /// commitment binding forces each supplied opening to be THE opening
+    /// of its admitted commitment, and the validity predicate is
+    /// deterministic from there.
+    pub openings: &'a crate::protocol::admission::AdmittedOpenings,
     /// Status of the public tally proof check.
     pub tally_proof: TallyProofStatus,
 }
@@ -154,17 +159,44 @@ pub fn judge_tallied_as_recorded(
         }
     }
 
-    // (6) duplicate status under the public rule.
-    let dup_before = evidence.prior_evaluations.iter().any(|e| {
-        e.ballot_index < board_index
-            && e.voter_id == Some(pt.id)
-            && matches!(e.status, InternalBallotStatus::Counted)
-    });
-    if dup_before {
+    // (6) duplicate status under the public rule, RECOMPUTED by the judge
+    // from the admitted board and the EA-supplied openings (never from
+    // authority-computed labels). Only prior ballots claiming the SAME
+    // identity can precede this one under FirstValidCounts, and their
+    // validity is deterministic given r_ea for that identity.
+    if evidence.openings.openings.len() < board_index {
         return JudgeReport::new(
-            Verdict::VoterFaulty,
-            "ballot is valid but an earlier valid ballot for this voter counts first",
+            Verdict::Undetermined,
+            "authority evidence incomplete: openings missing for slots preceding the ballot",
         );
+    }
+    for j in 0..board_index {
+        match crate::protocol::filter_and_tally::ballot_is_valid_for_id(
+            pp,
+            registration_state,
+            admitted,
+            evidence.openings,
+            j,
+            pt.id,
+            r_ea,
+        ) {
+            Ok(true) => {
+                return JudgeReport::new(
+                    Verdict::VoterFaulty,
+                    "ballot is valid but an earlier valid ballot for this voter counts first",
+                );
+            }
+            Ok(false) => {}
+            Err(_) => {
+                // Binding: the true opening of com_j is unique, so a
+                // supplied opening that does not open it is fabricated
+                // authority evidence.
+                return JudgeReport::new(
+                    Verdict::AuthorityFaulty,
+                    "authority-supplied opening does not open its admitted commitment",
+                );
+            }
+        }
     }
 
     // (7) the ballot is valid and first: it must have been counted. Whether

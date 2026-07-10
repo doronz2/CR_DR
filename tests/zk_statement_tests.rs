@@ -16,7 +16,6 @@ struct Instance {
     bb: BulletinBoard,
     admitted: AdmittedBoard,
     openings: AdmittedOpenings,
-    ballots: Vec<cr_dr::types::Ballot>,
     tally: cr_dr::types::TallyResult,
     statement: cr_dr::zk::statement::TallyStatement,
     witness: cr_dr::zk::witness::TallyWitness,
@@ -48,7 +47,8 @@ fn build_instance(seed: u64) -> Instance {
     let statement = build_tally_statement(&env.pp, &admitted, &env.reg, &tally);
     let witness =
         build_tally_witness(&env.pp, &env.authority, &env.reg, &admitted, &openings).unwrap();
-    Instance { env, bb, admitted, openings, ballots, tally, statement, witness }
+    let _ = &ballots;
+    Instance { env, bb, admitted, openings, tally, statement, witness }
 }
 
 #[test]

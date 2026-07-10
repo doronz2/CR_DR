@@ -15,7 +15,6 @@ use cr_dr::disputes::tallied_as_recorded::{
     judge_tallied_as_recorded, AuthorityEvidence, NonceSource, TalliedAsRecordedComplaint,
     TallyProofStatus,
 };
-use cr_dr::protocol::bulletin_board::BulletinBoard;
 use cr_dr::protocol::fake_compliance::{build_fake_ballot, fake_compliance};
 use cr_dr::protocol::filter_and_tally::filter_and_tally;
 use cr_dr::protocol::vote::cast_vote;
@@ -138,8 +137,6 @@ fn public_detailed_verdicts_leak_evasion_status() {
     let fake = build_fake_ballot(&env.pp, &t, &mut env.rng).unwrap();
     let real = cast_vote(&env.pp, &env.reg, &coerced, 0, &mut env.rng).unwrap();
     let (adm, opn) = admitted_from_ballots(&[fake.clone(), real.clone()]);
-    let (_, evals) =
-        filter_and_tally(&env.pp, &env.authority, &env.reg, &adm, &opn).unwrap();
     let r_ea = env.authority.r_ea(coerced.id).unwrap();
 
     let judge = |ballot: &cr_dr::types::Ballot| {
@@ -147,7 +144,7 @@ fn public_detailed_verdicts_leak_evasion_status() {
         let complaint = TalliedAsRecordedComplaint { com: ballot.com, opening };
         let evidence = AuthorityEvidence {
             nonce_source: NonceSource::Direct(r_ea),
-            prior_evaluations: &evals,
+            openings: &opn,
             tally_proof: TallyProofStatus::Verified,
         };
         judge_tallied_as_recorded(&env.pp, &env.reg, &adm, &complaint, &evidence)

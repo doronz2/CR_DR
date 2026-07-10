@@ -22,7 +22,11 @@ use crate::disputes::judge::{JudgeReport, Verdict};
 use crate::protocol::bulletin_board::{AdmittedBoard, BulletinBoard};
 use crate::types::{AuthoritySecretState, F, PublicParams};
 
-/// Direct recorded-as-cast check (Path 1): exact entry bytes on BB_raw.
+/// Direct recorded-as-cast BYTE check (Path 1): exact entry bytes
+/// (com || ct_open) on BB_raw. NOTE: entry presence alone does not imply
+/// admission — Clean keeps an entry only if a verifying pi_cast
+/// accompanies it. Adjudication must therefore use
+/// `adjudicate_recorded_as_cast`, which checks the accompanying proof.
 pub fn check_direct(bb: &BulletinBoard, ballot_bytes: &[u8]) -> bool {
     bb.contains_exact_bytes(ballot_bytes)
 }
@@ -93,22 +97,50 @@ pub fn adjudicate_admission_receipt(
     )
 }
 
-/// Path-1 recorded-as-cast adjudication over the RAW board: without a
-/// receipt (Path 1 has none), absence of the exact entry bytes is not by
-/// itself attributable — the channel model carries no acknowledgments.
-pub fn adjudicate_recorded_as_cast(
+/// Path-1 recorded-as-cast adjudication over the RAW board. A raw
+/// submission is (com, ct_open, pi_cast): the entry BYTES being present is
+/// not enough — Clean admits an entry only if a verifying pi_cast
+/// accompanies it, so the adjudication checks the proof at each matching
+/// index (via `verify`, typically `zk::cast::verify_cast_entry`). Without
+/// a receipt (Path 1 has none), absence — of the entry or of its proof —
+/// is not by itself attributable: the channel model carries no
+/// acknowledgments.
+pub fn adjudicate_recorded_as_cast<Fv>(
     _pp: &PublicParams,
     bb: &BulletinBoard,
+    proofs: &[Option<crate::zk::cast::CastProof>],
     ballot_bytes: &[u8],
-) -> JudgeReport {
-    if bb.contains_exact_bytes(ballot_bytes) {
-        return JudgeReport::new(
-            Verdict::VoterFaulty,
-            "entry bytes are present on the raw board; complaint unfounded",
-        );
+    mut verify: Fv,
+) -> crate::errors::Result<JudgeReport>
+where
+    Fv: FnMut(&crate::types::PublicBallot, &crate::zk::cast::CastProof) -> crate::errors::Result<bool>,
+{
+    let entries = bb.list_public_ballots();
+    let mut entry_present = false;
+    for (i, entry) in entries.iter().enumerate() {
+        if entry.bytes() != ballot_bytes {
+            continue;
+        }
+        entry_present = true;
+        if let Some(Some(proof)) = proofs.get(i) {
+            if verify(entry, proof)? {
+                return Ok(JudgeReport::new(
+                    Verdict::VoterFaulty,
+                    "entry bytes are present on the raw board with a verifying pi_cast; \
+                     public Clean admits it; complaint unfounded",
+                ));
+            }
+        }
     }
-    JudgeReport::new(
+    if entry_present {
+        return Ok(JudgeReport::new(
+            Verdict::Undetermined,
+            "entry bytes are present but no verifying pi_cast accompanies them — Clean \
+             drops the entry, and the channel model cannot attribute the missing proof",
+        ));
+    }
+    Ok(JudgeReport::new(
         Verdict::Undetermined,
         "entry absent and no admission receipt exists on this path; no evidence either way",
-    )
+    ))
 }

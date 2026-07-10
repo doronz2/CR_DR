@@ -183,6 +183,41 @@ pub fn filter_and_tally(
     Ok((TallyResult { counts, counted_ballots }, evaluations))
 }
 
+/// Judge-side mirror of the validity predicate for ONE claimed identity:
+/// is the opening at `pos` a VALID ballot claiming voter `id`, under the
+/// given authorized nonce for that id? Prior ballots claiming other
+/// identities are irrelevant to the duplicate rule and return false.
+/// Mirrors `evaluate_ballot_validity` stage by stage (eid binding,
+/// candidate set, signature, indexed registration + hidden nonce).
+/// Hard-errors when the supplied opening does not open the admitted
+/// commitment — that is an authority-evidence inconsistency, never a
+/// property of the ballot.
+pub fn ballot_is_valid_for_id(
+    pp: &PublicParams,
+    registration_state: &RegistrationState,
+    admitted: &AdmittedBoard,
+    openings: &AdmittedOpenings,
+    pos: usize,
+    id: u64,
+    r_ea: crate::types::F,
+) -> Result<bool> {
+    let (pt_fields, _r_com) = opening_checked(admitted, openings, pos)?;
+    let Ok(pt) = BallotPlaintext::from_fields(&pt_fields) else {
+        return Ok(false);
+    };
+    if pt.id != id || pt.eid_hash != pp.eid_hash {
+        return Ok(false);
+    }
+    if !pp.candidates.contains(&pt.candidate) {
+        return Ok(false);
+    }
+    let msg = sig_msg_hash(pt.eid_hash, pt.id, pt.candidate, pt.r);
+    if !verify(&pt.vk, msg, &pt.sigma) {
+        return Ok(false);
+    }
+    Ok(registration_check(pp, registration_state, &pt, r_ea) == RegistrationCheck::Ok)
+}
+
 /// Validity verdict of a single ballot, before duplicate handling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BallotValidity {

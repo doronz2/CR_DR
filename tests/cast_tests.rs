@@ -13,7 +13,7 @@ use cr_dr::protocol::fake_compliance::{build_fake_ballot, fake_compliance};
 use cr_dr::protocol::vote::cast_vote;
 use cr_dr::types::{f_to_dec, Ballot, F};
 use cr_dr::zk::cast::{
-    cast_relation_check_native, prove_cast, verify_cast_entry, CastProof, CAST_CIRCUIT,
+    cast_relation_check_native, prove_cast, verify_cast_entry, CAST_CIRCUIT,
 };
 use cr_dr::zk::groth16_backend::SnarkjsBackend;
 

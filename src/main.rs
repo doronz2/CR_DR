@@ -58,7 +58,35 @@ use cr_dr::zk::statement::{
     build_tally_statement, statement_matches_public_data, TallyStatement,
 };
 use cr_dr::zk::witness::build_tally_witness;
-use cr_dr::zk::SMALL_SHAPE;
+use cr_dr::zk::{CircuitShape, MEDIUM_SHAPE, SMALL_SHAPE};
+
+/// Resolve the compiled tally-circuit variant matching the election's
+/// parameters. Groth16 artifacts are shape-specific — proving with the
+/// wrong shape fails (or, worse, binds a different relation) — so the
+/// election parameters must EXACTLY match a compiled variant.
+fn tally_circuit_for(pp: &PublicParams) -> Result<(CircuitShape, &'static str, &'static str)> {
+    const VARIANTS: [(CircuitShape, &str, &str); 2] = [
+        (SMALL_SHAPE, "filter_and_tally_small", "small"),
+        (MEDIUM_SHAPE, "filter_and_tally_medium", "medium"),
+    ];
+    for (shape, circuit, variant) in VARIANTS {
+        if pp.max_ballots == shape.num_ballots
+            && pp.candidates.len() == shape.num_candidates
+            && pp.merkle_depth == shape.merkle_depth
+        {
+            return Ok((shape, circuit, variant));
+        }
+    }
+    bail!(
+        "no compiled tally circuit matches these election parameters \
+         (max_ballots={}, candidates={}, merkle_depth={}); compiled variants: \
+         small (16 slots, 3 candidates, depth 4), medium (128 slots, 3 candidates, depth 6). \
+         Re-run `setup` with matching parameters or add/compile a new circuit variant.",
+        pp.max_ballots,
+        pp.candidates.len(),
+        pp.merkle_depth
+    )
+}
 
 #[derive(Parser)]
 #[command(
@@ -443,12 +471,33 @@ fn main() -> Result<()> {
 
         Cmd::Submit { ballot } => {
             let b: Ballot = read_json(&ballot, "ballot")?;
+            let pp: PublicParams = read_json(&paths.params(), "public params")?;
             let mut channel: AnonymousChannel = read_json_or_default(&paths.channel())?;
-            // Only the PUBLIC entry (com, ct_open) enters the channel; the
-            // cast secret stays in the voter's ballot file.
-            channel.submit(b.public());
+            // Path 1 submission is (com, ct_open, pi_cast): Clean keeps
+            // ONLY entries with a verifying pi_cast, so the proof is
+            // generated here (proofless submissions would always be
+            // dropped at admission). Path 2 needs no proof: use
+            // `ea-submit` instead.
+            let root = SnarkjsBackend::crate_root();
+            let cast_be = SnarkjsBackend {
+                root: root.clone(),
+                circuit: cr_dr::zk::cast::CAST_CIRCUIT.into(),
+            };
+            if !cast_be.toolchain_available() {
+                bail!(
+                    "cast circuit artifacts missing — Path-1 submission requires pi_cast \
+                     (compile_circuits.sh cast + setup_groth16.sh cast), or use `ea-submit` \
+                     for Path-2 EA-mediated admission"
+                );
+            }
+            let proof = cr_dr::zk::cast::prove_cast(&root, &pp.pk_ea, &b.public(), &b.secret)?;
+            // Only the PUBLIC entry (com, ct_open) + pi_cast enter the
+            // channel; the cast secret stays in the voter's ballot file.
+            channel.submit_with_proof(b.public(), proof);
             write_json(&paths.channel(), &channel)?;
-            println!("ballot queued in the anonymous channel (flush with `cr_dr flush-channel`)");
+            println!(
+                "ballot + pi_cast queued in the anonymous channel (flush with `cr_dr flush-channel`)"
+            );
         }
 
         Cmd::FlushChannel => {
@@ -515,18 +564,20 @@ fn main() -> Result<()> {
                 read_json(&paths.openings(), "EA openings store")?;
             let statement: TallyStatement =
                 read_json(&paths.statement(), "public statement (run `tally` first)")?;
+            let (shape, circuit, variant) = tally_circuit_for(&pp)?;
             let witness = build_tally_witness(&pp, &authority, &reg, &admitted, &openings)?;
-            if !relation_check_native(&statement, &witness, &SMALL_SHAPE) {
+            if !relation_check_native(&statement, &witness, &shape) {
                 bail!("native relation check failed — statement and board disagree");
             }
-            let backend = SnarkjsBackend::small(SnarkjsBackend::crate_root());
+            let backend =
+                SnarkjsBackend { root: SnarkjsBackend::crate_root(), circuit: circuit.into() };
             if !backend.toolchain_available() {
                 bail!(
                     "Groth16 artifacts missing. Run:\n  scripts/install_circom_deps.sh\n  \
-                     scripts/compile_circuits.sh small\n  scripts/setup_groth16.sh small"
+                     scripts/compile_circuits.sh {variant}\n  scripts/setup_groth16.sh {variant}"
                 );
             }
-            let input = generate_witness_input(&statement, &witness, &SMALL_SHAPE)?;
+            let input = generate_witness_input(&statement, &witness, &shape)?;
             println!("native relation check: ACCEPT; generating Groth16 proof...");
             let (proof, public) = backend.prove(&input)?;
             write_json(&paths.proofs().join("proof.json"), &proof)?;
@@ -535,9 +586,12 @@ fn main() -> Result<()> {
         }
 
         Cmd::Verify { proof, public } => {
-            let backend = SnarkjsBackend::small(SnarkjsBackend::crate_root());
+            let pp: PublicParams = read_json(&paths.params(), "public params")?;
+            let (_, circuit, variant) = tally_circuit_for(&pp)?;
+            let backend =
+                SnarkjsBackend { root: SnarkjsBackend::crate_root(), circuit: circuit.into() };
             if !backend.toolchain_available() {
-                bail!("Groth16 artifacts missing (compile + setup first)");
+                bail!("Groth16 artifacts missing (compile + setup the `{variant}` variant first)");
             }
             let proof_v: serde_json::Value = read_json(&proof, "proof")?;
             let public_v: serde_json::Value = read_json(&public, "public inputs")?;
@@ -545,7 +599,6 @@ fn main() -> Result<()> {
             // The proof is only meaningful for THE statement determined by
             // the public election data, so bind everything together:
             // public data -> statement -> tally -> proof public inputs.
-            let pp: PublicParams = read_json(&paths.params(), "public params")?;
             let reg: RegistrationState = read_json(&paths.registration(), "registration")?;
             let admitted: AdmittedBoard =
                 read_json(&paths.admitted(), "admitted board")?;
@@ -656,10 +709,34 @@ fn main() -> Result<()> {
                     print_judge_report(&adjudicate_admission_receipt(&pp, &admitted, &r));
                 }
                 None => {
-                    // Path 1: exact entry bytes on the raw board.
+                    // Path 1: exact entry bytes AND a verifying pi_cast on
+                    // the raw board (entry presence alone does not imply
+                    // admission — Clean drops proofless entries).
                     let board: BulletinBoard = read_json_or_default(&paths.board())?;
+                    let proofs: Vec<Option<cr_dr::zk::cast::CastProof>> =
+                        read_json_or_default(&paths.cast_proofs())?;
                     let b: Ballot = read_json(&ballot, "ballot")?;
-                    print_judge_report(&adjudicate_recorded_as_cast(&pp, &board, &b.bytes()));
+                    let root = SnarkjsBackend::crate_root();
+                    let cast_be = SnarkjsBackend {
+                        root: root.clone(),
+                        circuit: cr_dr::zk::cast::CAST_CIRCUIT.into(),
+                    };
+                    if !cast_be.toolchain_available() {
+                        bail!(
+                            "cast circuit artifacts missing — cannot check pi_cast \
+                             (compile_circuits.sh cast + setup_groth16.sh cast)"
+                        );
+                    }
+                    let report = adjudicate_recorded_as_cast(
+                        &pp,
+                        &board,
+                        &proofs,
+                        &b.bytes(),
+                        |entry, proof| {
+                            cr_dr::zk::cast::verify_cast_entry(&root, &pp.pk_ea, entry, proof)
+                        },
+                    )?;
+                    print_judge_report(&report);
                 }
             }
         }
@@ -682,8 +759,9 @@ fn main() -> Result<()> {
             );
             let pt = cr_dr::types::BallotPlaintext::from_fields(&opening.plaintext_fields)?;
 
-            // Judge-private evidence from the authority side.
-            let (_, evals) = filter_and_tally(&pp, &authority, &reg, &admitted, &openings)?;
+            // Judge-private evidence from the authority side: the openings
+            // store itself — the judge RECOMPUTES the duplicate predicate
+            // from it rather than accepting authority-computed labels.
             let nonce_source = if use_threshold {
                 // The judge collects exactly t shares from t authorities.
                 let secret = authority
@@ -708,7 +786,9 @@ fn main() -> Result<()> {
             // uncheckable proof is Unavailable — NEVER assumed valid.
             let proof_path = paths.proofs().join("proof.json");
             let public_path = paths.proofs().join("public.json");
-            let backend = SnarkjsBackend::small(SnarkjsBackend::crate_root());
+            let (_, circuit, _) = tally_circuit_for(&pp)?;
+            let backend =
+                SnarkjsBackend { root: SnarkjsBackend::crate_root(), circuit: circuit.into() };
             let tally_proof = if proof_path.exists()
                 && public_path.exists()
                 && paths.statement().exists()
@@ -736,7 +816,7 @@ fn main() -> Result<()> {
             let complaint = TalliedAsRecordedComplaint { com: b.com, opening };
             let evidence = AuthorityEvidence {
                 nonce_source,
-                prior_evaluations: &evals,
+                openings: &openings,
                 tally_proof,
             };
             print_judge_report(&judge_tallied_as_recorded(&pp, &reg, &admitted, &complaint, &evidence));
