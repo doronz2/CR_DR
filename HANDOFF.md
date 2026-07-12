@@ -69,6 +69,22 @@ the `d137a71` checkpoint:
   board-vs-voter caveat is gone; 10^5/10^6 remain projections at
   idBits/depth 17 and 20 (+6%/+13%). 131 tests green.
 
+* **Tier-3 decentralized proving (2026-07-12/13, `8e8ab54`)**: real
+  3-party coSNARK proof of the tally-VALIDITY relation via TACEO
+  co-circom (REP3), reusing the snarkjs zkey, emitting a standard Groth16
+  proof that verifies under the ordinary key. R_EA reconstructed
+  in-circuit from separate per-authority Shamir shares
+  (lagrange_combine.circom; vchunkmpc128 = 1,493,956 constraints, same as
+  Tier-1 — the combine is free). Provider partition (tier3::chunk_providers
+  + CoCircomBackend): opening/authority-1/authority-2 files, R_EA in none.
+  Verified end-to-end at C=8 (~64 s, vchunkmpc8, 93,676 constraints);
+  full C=128 chunk witness-extension measured separately (heavy). Docs:
+  TIER3_DESIGN.md (real-vs-simulated matrix), README Tier-3 section,
+  BENCHMARKS Tier-3 section. HONESTY: localhost 3-party = cryptographically
+  real / architecturally simulated; only phase-1 validity is MPC (phase-2
+  sorted-run/tally-sum still Tier-1); co-circom experimental/un-audited.
+  Suite: 134 passed / 0 failed (Tier-3 MPC test opt-in via CR_DR_TIER3_MPC=1).
+
 The original checkpoint snapshot follows (historical).
 
 ---

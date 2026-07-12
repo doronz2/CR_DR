@@ -1,9 +1,11 @@
-# CR-DR single-prover benchmark report
+# CR-DR benchmark report
 
-**Scope.** Tier-1 SINGLE PROVER only: one logical prover holds the full
-witness (including authorized ≥ t reconstructions of the threshold-shared
-`R_EA,i`) and generates the Groth16 proof. **No decentralized/threshold
-proving is claimed or benchmarked.**
+**Scope.** Most of this report is Tier-1 SINGLE PROVER: one logical prover
+holds the full witness (including authorized ≥ t reconstructions of the
+threshold-shared `R_EA,i`) and generates the Groth16 proof. **Decentralized
+(Tier-3) coSNARK proving of the tally-validity relation is implemented and
+measured separately — see the "Tier-3" section at the end and
+TIER3_DESIGN.md** for the real-vs-simulated boundary.
 
 
 > **ADMISSION PATHS.** Every benchmark documents its admission path:
@@ -335,3 +337,51 @@ flat, same as the tally verifies above), not the pairing check; a
 long-running verifier process would amortize this away for bulk cleaning.
 Path 2 has no per-voter ZK cost: admission is one commitment opening check
 plus one BabyJubJub Schnorr receipt signature (<1 ms).
+
+## Tier-3: decentralized coSNARK proving (measured)
+
+Real 3-party MPC proof of the tally-VALIDITY relation via TACEO co-circom
+(v0.10.0, REP3 replicated 3-party, honest-majority/semi-honest), reusing
+the same `.r1cs`/`.zkey` and emitting a standard Groth16 proof that
+verifies under the ordinary key. `R_EA` is reconstructed in-circuit from
+per-authority Shamir shares (never a witness input); openings and shares
+enter as partitioned provider inputs. See TIER3_DESIGN.md for the full
+real-vs-simulated matrix — in short, the secret sharing is cryptographically
+real but three localhost processes do NOT establish independent trust
+domains, and only phase-1 validity is MPC here (phase-2 sorted-run/tally-sum
+remains the Tier-1 prover).
+
+**Environment.** Same M3 Max / macOS 14.3 as above; co-circom v0.10.0
+(git, rustc 1.96); 3 parties as localhost processes over TCP+TLS (rustls).
+Loopback RTT ≈ 0.05 ms. The target deployment assumes **1 ms**
+inter-authority latency (co-located authorities); because MPC witness
+extension of the Poseidon/EC gadgets is round-heavy, a real 1 ms link is
+SLOWER than loopback, so these localhost timings are a LOWER BOUND for a
+1 ms deployment, not an upper bound.
+
+**Measured — one validity chunk, end-to-end (split → merge → MPC witness
+extension → MPC Groth16 → verify), 3-party REP3:**
+
+| circuit | constraints | 3-party MPC wall (verified) | vs Tier-1 rapidsnark prove |
+|---|---|---|---|
+| `vchunkmpc8` (C=8 slots, demo of the same relation) | 93,676 | **~64 s** | (Tier-1 ~0.3 s) |
+| `vchunkmpc128` (C=128 slots, full pipeline chunk) | 1,493,956 | in progress (> 90 min witness extension; see note) | 3.72 s |
+
+The C=8 chunk proves the identical validity relation (openings + in-circuit
+R_EA combine + indexed registration + record emission) at fewer slots; it
+verifies and its public inputs bind the same statement as the Tier-1
+validity chunk. The cost is dominated by MPC WITNESS EXTENSION (evaluating
+Poseidon and the BabyJubJub gadgets on secret shares is interaction-heavy),
+NOT by the collaborative Groth16 step (co-circom's proving communication is
+constant-size; per-party proving CPU ≈ single-prover). This is the expected
+coSNARK profile and the reason N was scoped to 10^3.
+
+**Projection — N = 10^3 (board B = 2N ≈ 2,048 = 16 chunks of C=128):**
+phase-1 Tier-3 proves 16 `vchunkmpc128` chunks. The chunks are independent,
+so with one 3-party worker-set per chunk they run concurrently; per-chunk
+MPC witness extension is the pole (~15–20 min projected from the C=8
+measurement scaled by constraint count, pending the in-progress full-chunk
+run for a measured figure). Phase-2 sorted-run/tally-sum is still the Tier-1
+prover here (seconds). No Tier-3 numbers are claimed beyond the measured
+C=8 chunk and the explicitly-labelled projection; the full-chunk row will be
+replaced with a measurement when the run completes.

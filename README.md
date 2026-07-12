@@ -289,12 +289,21 @@ depth 4, ≈116k constraints), medium (128 / 3 / 6, ≈1.0M), each also as a
 * **Tier 2 — trusted tally environment.** The same algorithm and interface,
   executed inside a protected, audited environment. Nothing in the code
   changes; not separately benchmarked.
-* **Tier 3 — decentralized/threshold prover (future).** Threshold
-  authorities jointly supply the witness without any single party learning
-  everything. The witness builder consumes `R_EA,i` exclusively through the
-  share-based `r_ea()` interface, so an MPC opening can replace it without
-  changing the relation. Not implemented; **no decentralized proving is
-  claimed or benchmarked**.
+* **Tier 3 — decentralized coSNARK prover (IMPLEMENTED for the validity
+  relation; see TIER3_DESIGN.md).** The tally-validity relation is proven
+  by a real 3-party MPC (TACEO **co-circom**, REP3) over a secret-shared
+  witness, reusing the same `.r1cs`/`.zkey` and emitting a standard Groth16
+  proof. `R_EA` is reconstructed IN-CIRCUIT from separate per-authority
+  Shamir shares (`components/lagrange_combine.circom`), so no party ever
+  holds it; ballot openings and R_EA shares enter as partitioned provider
+  inputs (`merge-input-shares`), so the witness is never assembled in the
+  clear. Run: `cargo run --release --bin prove_tier3 -- --width 8`.
+  **Honesty:** three localhost parties are *cryptographically real but
+  architecturally simulated* (one OS operator ≠ independent trust domains);
+  co-circom is experimental/un-audited and REP3 is honest-majority; and
+  only phase-1 validity is MPC here (phase-2 sorted-run/tally-sum is still
+  the Tier-1 prover). TIER3_DESIGN.md has the full real-vs-simulated
+  matrix.
 
 ### Cast-ZK encryption (BabyJubJub-ElGamal + Poseidon-pad hybrid)
 
@@ -351,8 +360,9 @@ constraints — small ≈ 116k, medium ≈ 1.0M), not by how many board slots ar
 occupied; one proof covers the whole board, so the cost is per-tally, not
 per-ballot. Verification is constant-time in circuit size (~0.2 s is
 node/snarkjs startup, not the pairing check). These are Tier-1 numbers: one
-logical prover with the full witness. No decentralized proving is
-benchmarked.
+logical prover with the full witness. Decentralized (Tier-3) coSNARK
+proving of the validity relation is implemented and benchmarked separately
+— see TIER3_DESIGN.md and the "Tier-3" section of BENCHMARKS.md.
 
 ### Scaling beyond one circuit: the chunked pipeline
 
@@ -519,7 +529,7 @@ receipt in a coercer's hands; it needs a separate treatment.
 |---|---|
 | `mod.rs` | `CircuitShape` (compile-time NB/NC/depth) and `SMALL_SHAPE` = (16, 3, 4), matching the compiled small circuit. |
 | `statement.rs` | `TallyStatement` — the public inputs and nothing else (eid_hash, MR, candidate-set commitment, bb_commitment, counts, sizes, rule id, pk_ea commitment); `build_tally_statement` from public data only; `statement_matches_public_data` — the native check verifiers must run alongside the proof (binds `num_voters`/`pk_ea_commitment`, which the circuit cannot constrain). |
-| `witness.rs` | `TallyWitness`/`BallotWitnessRow` (per-ballot private inputs: ct, 9 plaintext fields, rho, R_EA, indexed row values reg_vk/reg_h, sibling path at index id — direction bits are id's own bits, not witness). Documents the **prover tiers** (Tier 1 single prover implemented; Tier 3 replaces the share-based `r_ea()` call with MPC). `build_tally_witness` mirrors FilterAndTally and applies the **dummy-substitution policy** for hard-constraint-unsafe ballots. `padding_row`/`padded_rows` fill circuit slots beyond `num_ballots`. |
+| `witness.rs` | `TallyWitness`/`BallotWitnessRow` (per-ballot private inputs: ct, 9 plaintext fields, rho, R_EA, indexed row values reg_vk/reg_h, sibling path at index id — direction bits are id's own bits, not witness). Documents the **prover tiers** (Tier 1 single prover; Tier 3 decentralized coSNARK implemented for the validity relation — R_EA reconstructed in-circuit from shares, see `src/zk/tier3.rs` + TIER3_DESIGN.md). `build_tally_witness` mirrors FilterAndTally and applies the **dummy-substitution policy** for hard-constraint-unsafe ballots. `padding_row`/`padded_rows` fill circuit slots beyond `num_ballots`. |
 | `mock_backend.rs` | `relation_check_native` — the native mirror of the circuit, constraint-for-constraint: soft flags, deterministic strict-bits in-range flag, HARD gated indexed-row/root check (unsatisfiable ⇒ false), `batcher_schedule` (THE sorting-network schedule, shared with the circom side), sorted-record counting, BB chain, tally equality. Includes `circuit_sig_ok` with **bit-exact integer scalar multiplication** (`mul_bits`) matching circomlib semantics. |
 | `cast.rs` | pi_cast: `prove_cast` / `verify_cast_entry` (public-input binding + Groth16 verify + C1 subgroup check), `cast_relation_check_native` (mirror), input serialization. Verified PUBLICLY before tallying; never inside the tally circuit. |
 | `chunked.rs` | The CHUNKED pipeline: `build_chunked_tally` (records via the shared `eval_row`, global sort, blinded rc/sc commitments, Fiat-Shamir challenges, boundary chain, partial tallies, grand products), `chunked_relation_check_native` (every chunk-circuit constraint + every aggregator check), circom input serialization and expected public-input vectors per proof. |
