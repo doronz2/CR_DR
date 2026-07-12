@@ -365,7 +365,7 @@ extension → MPC Groth16 → verify), 3-party REP3:**
 | circuit | constraints | 3-party MPC wall (verified) | vs Tier-1 rapidsnark prove |
 |---|---|---|---|
 | `vchunkmpc8` (C=8 slots, demo of the same relation) | 93,676 | **~64 s** | (Tier-1 ~0.3 s) |
-| `vchunkmpc128` (C=128 slots, full pipeline chunk) | 1,493,956 | in progress (> 90 min witness extension; see note) | 3.72 s |
+| `vchunkmpc128` (C=128 slots, full pipeline chunk) | 1,493,956 | **~900 s** (witness ext. 884 s + collab. Groth16 14 s), verified | 3.72 s |
 
 The C=8 chunk proves the identical validity relation (openings + in-circuit
 R_EA combine + indexed registration + record emission) at fewer slots; it
@@ -376,12 +376,19 @@ NOT by the collaborative Groth16 step (co-circom's proving communication is
 constant-size; per-party proving CPU ≈ single-prover). This is the expected
 coSNARK profile and the reason N was scoped to 10^3.
 
+The split between the two MPC phases is the headline finding: collaborative
+Groth16 **proving is cheap (14 s** for the 1.49 M-constraint chunk — co-circom's
+proving communication is constant-size and per-party CPU ≈ a single
+rapidsnark prover), while MPC **witness extension dominates (884 s)** because
+every Poseidon S-box and BabyJubJub gadget is evaluated interactively on
+shares. Optimising the MPC witness extension (or a lighter-hash tally
+relation) is the lever, not the proving step.
+
 **Projection — N = 10^3 (board B = 2N ≈ 2,048 = 16 chunks of C=128):**
-phase-1 Tier-3 proves 16 `vchunkmpc128` chunks. The chunks are independent,
-so with one 3-party worker-set per chunk they run concurrently; per-chunk
-MPC witness extension is the pole (~15–20 min projected from the C=8
-measurement scaled by constraint count, pending the in-progress full-chunk
-run for a measured figure). Phase-2 sorted-run/tally-sum is still the Tier-1
-prover here (seconds). No Tier-3 numbers are claimed beyond the measured
-C=8 chunk and the explicitly-labelled projection; the full-chunk row will be
-replaced with a measurement when the run completes.
+phase-1 Tier-3 proves 16 `vchunkmpc128` chunks at the MEASURED ~900 s each.
+The chunks are independent, so with one 3-party worker-set per chunk they
+run CONCURRENTLY — ~15 min wall (16 worker-sets) up to ~4 h if fully
+sequential on one machine. Phase-2 sorted-run/tally-sum is still the Tier-1
+prover here (seconds). This is the measured full-chunk cost times the chunk
+count; it is a projection only in the sense that we measured ONE chunk, not
+all 16 (they are identical circuits on disjoint slots).

@@ -128,10 +128,18 @@ security boundary.
 
 ## Measured (M3 Max; localhost REP3; see BENCHMARKS.md "Tier-3")
 
-A C=8 validity chunk (93,676 constraints — the same relation as the full
-C=128 chunk, fewer slots) proves + verifies in 3-party MPC in ~64–71 s
-end-to-end (split → merge → MPC witness extension → MPC Groth16 → verify),
-producing a standard proof bound to the same statement as Tier-1.
+Two chunk widths, both proved + verified end-to-end in 3-party REP3
+(split → merge → MPC witness extension → MPC Groth16 → verify), each a
+standard proof bound to the same statement as Tier-1:
+
+- **C=8** (93,676 constraints): ~64 s end-to-end — the fast demonstrator.
+- **C=128** (1,493,956 constraints, the full pipeline chunk): witness
+  extension **884 s** + collaborative Groth16 **14 s** ≈ **15 min**,
+  verified. The proving step is cheap (constant-size communication,
+  per-party CPU ≈ one rapidsnark prover); MPC witness extension of the
+  Poseidon/EC gadgets is the pole. For N=10^3 (16 chunks) the chunks are
+  independent, so with one 3-party worker-set per chunk they run
+  concurrently (~15 min wall) up to ~4 h fully sequential.
 
 Latency note: on loopback the round-trip is ~0.05 ms; the benchmarked
 regime assumes **1 ms** inter-server latency (co-located authorities).
