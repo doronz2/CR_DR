@@ -21,7 +21,10 @@ pragma circom 2.0.0;
 //
 // * DETERMINISTIC in-range flag: the claimed id is decomposed with
 //   Num2Bits_strict (canonical, < p — the prover has NO freedom in the
-//   bits), in_range = (id < 2^8) AND (id < num_voters).
+//   bits), in_range = (id < 2^idBits) AND (id < num_voters). idBits is a
+//   template parameter: 8 in the monolithic circuits (num_voters is
+//   bounded by 2^depth <= 64 there anyway), 14 in the chunked pipeline
+//   (up to 16,384 registered voters).
 //
 // * HARD, gated by (active AND in_range): the registration row fetch. The
 //   witness supplies the row values (reg_vkx, reg_vky, reg_h) and sibling
@@ -40,10 +43,10 @@ include "circomlib/circuits/poseidon.circom";
 include "./poseidon_hashes.circom";
 include "./signature_verify.circom";
 
-template BallotValidity(depth, nCand) {
+template BallotValidity(depth, nCand, idBits) {
     signal input eid_hash;          // public election id hash
     signal input mr;                // public registration Merkle root
-    signal input num_voters;        // public, 8-bit (checked by main)
+    signal input num_voters;        // public, idBits-bit (checked by main)
     signal input active;            // 0/1, derived from public num_ballots
     signal input candidates[nCand];
     signal input ct;
@@ -56,7 +59,7 @@ template BallotValidity(depth, nCand) {
     signal input pathElements[depth];
 
     signal output valid;            // active-gated 0/1 validity
-    signal output id_eff;           // valid * id (< 2^8)
+    signal output id_eff;           // valid * id (< 2^idBits)
     signal output m;                // candidate index (0 if no match)
     signal output candSel[nCand];
 
@@ -107,21 +110,21 @@ template BallotValidity(depth, nCand) {
     sig.msg <== msgh.out;
 
     // (5) deterministic in-range flag from the STRICT id decomposition
-    component idBits = Num2Bits_strict();
-    idBits.in <== pt[1];
+    component idb = Num2Bits_strict();
+    idb.in <== pt[1];
     var hiSum = 0;
-    for (var d = 8; d < 254; d++) {
-        hiSum += idBits.out[d];
+    for (var d = idBits; d < 254; d++) {
+        hiSum += idb.out[d];
     }
     component hiZero = IsZero();
     hiZero.in <== hiSum;
     var loSum = 0;
-    for (var d = 0; d < 8; d++) {
-        loSum += idBits.out[d] * (1 << d);
+    for (var d = 0; d < idBits; d++) {
+        loSum += idb.out[d] * (1 << d);
     }
     signal id_low;
     id_low <== loSum;
-    component ltNv = LessThan(9);
+    component ltNv = LessThan(idBits + 1);
     ltNv.in[0] <== id_low;
     ltNv.in[1] <== num_voters;
     signal in_range;
@@ -145,8 +148,8 @@ template BallotValidity(depth, nCand) {
     component hh[depth];
     cur[0] <== leafH.out;
     for (var d = 0; d < depth; d++) {
-        left[d] <== cur[d] + idBits.out[d] * (pathElements[d] - cur[d]);
-        right[d] <== pathElements[d] + idBits.out[d] * (cur[d] - pathElements[d]);
+        left[d] <== cur[d] + idb.out[d] * (pathElements[d] - cur[d]);
+        right[d] <== pathElements[d] + idb.out[d] * (cur[d] - pathElements[d]);
         hh[d] = Poseidon(2);
         hh[d].inputs[0] <== left[d];
         hh[d].inputs[1] <== right[d];

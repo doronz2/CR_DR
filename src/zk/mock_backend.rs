@@ -56,9 +56,21 @@ pub fn batcher_schedule(n: usize) -> Vec<(usize, usize)> {
     out
 }
 
+/// Identity width of the CHUNKED pipeline: ids < 2^ID_BITS, the cross-run
+/// sentinel is 2^ID_BITS, and num_voters is range-checked to ID_BITS bits
+/// (16,384-voter registration capacity at 14). The MONOLITHIC circuits
+/// keep an 8-bit in-range check; this native mirror uses ID_BITS for both,
+/// which agrees with the 8-bit circuits on every reachable input because
+/// their num_voters is bounded by 2^merkle_depth <= 64 < 2^8 (an id in
+/// [2^8, 2^ID_BITS) fails id < num_voters on both sides).
+pub const ID_BITS: usize = 14;
+/// The chunked pipeline's cross-run sentinel identity (= 2^ID_BITS).
+pub const SENTINEL_ID: u64 = 1 << ID_BITS;
+
 /// One private record as the circuit sees it (all values already
 /// range-bounded by the relation: valid is 0/1, id < 2^8, pos < 2^8 in the
-/// monolithic circuit; pos < 2^24 in the chunked pipeline).
+/// monolithic circuit; id < 2^(ID_BITS+1), pos < 2^24 in the chunked
+/// pipeline).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rec {
     pub valid: bool,
@@ -74,15 +86,16 @@ impl Rec {
         ((!self.valid as u64) << 16) | (self.id << 8) | self.pos
     }
 
-    /// key = (1-valid)*2^33 + id*2^24 + pos, the CHUNKED pipeline's wider
-    /// packing (global 24-bit positions, 9-bit ids incl. the sentinel).
+    /// key = (1-valid)*2^(25+ID_BITS) + id*2^24 + pos, the CHUNKED
+    /// pipeline's wider packing (global 24-bit positions, (ID_BITS+1)-bit
+    /// ids incl. the sentinel).
     pub fn key_wide(&self) -> u64 {
-        ((!self.valid as u64) << 33) | (self.id << 24) | self.pos
+        ((!self.valid as u64) << (25 + ID_BITS)) | (self.id << 24) | self.pos
     }
 
-    /// The cross-run sentinel predecessor record: id = 256 collides with
-    /// no real id (< 2^8) and no invalid-row id (0).
-    pub const SENTINEL: Rec = Rec { valid: false, id: 256, pos: 0, m: 0 };
+    /// The cross-run sentinel predecessor record: id = 2^ID_BITS collides
+    /// with no real id (< 2^ID_BITS) and no invalid-row id (0).
+    pub const SENTINEL: Rec = Rec { valid: false, id: SENTINEL_ID, pos: 0, m: 0 };
 }
 
 /// Per-row evaluation shared by the monolithic relation checker and the
@@ -127,10 +140,10 @@ pub fn eval_row(
 
     // Deterministic in-range flag from the STRICT bit decomposition.
     let id_bits = pt[1].into_bigint().to_bits_le();
-    let is_small = !id_bits.iter().skip(8).any(|b| *b);
+    let is_small = !id_bits.iter().skip(ID_BITS).any(|b| *b);
     let id_low: u64 = id_bits
         .iter()
-        .take(8)
+        .take(ID_BITS)
         .enumerate()
         .map(|(d, b)| (*b as u64) << d)
         .sum();

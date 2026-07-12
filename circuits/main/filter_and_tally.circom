@@ -112,7 +112,7 @@ template FilterAndTally(nB, nC, depth, dupStrategy) {
     // per-ballot validity + record extraction
     component bv[nB];
     for (var j = 0; j < nB; j++) {
-        bv[j] = BallotValidity(depth, nC);
+        bv[j] = BallotValidity(depth, nC, 8); // monolithic: 8-bit ids (num_voters <= 2^depth <= 64)
         bv[j].eid_hash <== eid_hash;
         bv[j].mr <== mr;
         bv[j].num_voters <== num_voters;

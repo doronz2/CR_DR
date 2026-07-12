@@ -1,8 +1,9 @@
 pragma circom 2.0.0;
 
 // Chunked pipeline, phase 1: ValidityChunk with C = 128 slots,
-// 3 candidates, Merkle depth 6 (NUM_VOTERS <= 64). Boards up to 2^16
-// slots via 16-bit global positions.
+// 3 candidates, Merkle depth 14 and 14-bit identities (NUM_VOTERS up to
+// 2^14 = 16,384 registered voters). Boards up to 2^24 slots via 24-bit
+// global positions.
 
 include "./validity_chunk.circom";
 
@@ -19,4 +20,4 @@ component main {
         bb_out,
         rc
     ]
-} = ValidityChunk(128, 3, 6);
+} = ValidityChunk(128, 3, 14, 14);

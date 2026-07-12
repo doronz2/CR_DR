@@ -16,3 +16,5 @@ prove_chunked_10k.log
 regen_srun_tsum.log
 campaign.log
 receipt.json
+widen_campaign.log
+e2e_points.log

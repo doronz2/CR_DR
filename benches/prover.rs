@@ -469,9 +469,9 @@ fn build_chunked_instance(seed: u64, n_ballots: usize) -> cr_dr::zk::chunked::Ch
     let cfg = ElectionConfig {
         eid: format!("bench-chunked-{n_ballots}"),
         candidates: vec![0, 1, 2],
-        max_voters: 64,
+        max_voters: 1 << 14,
         max_ballots: 1 << 16,
-        merkle_depth: 6,
+        merkle_depth: 14,
         duplicate_rule: DuplicateRule::FirstValidCounts,
         threshold_params: Some(cr_dr::types::ThresholdParams { t: 2, k: 3 }),
     };

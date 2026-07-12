@@ -23,7 +23,7 @@ include "circomlib/circuits/bitify.circom";
 include "../components/ballot_validity.circom";
 include "../components/record_chain.circom";
 
-template ValidityChunk(C, nC, depth) {
+template ValidityChunk(C, nC, depth, idBits) {
     // ---------------- public inputs ----------------
     signal input eid_hash;
     signal input mr;
@@ -61,10 +61,10 @@ template ValidityChunk(C, nC, depth) {
     nbBits.in <== num_ballots;
     component cbBits = Num2Bits(24);
     cbBits.in <== chunk_base;
-    component nvBits = Num2Bits(8);
+    component nvBits = Num2Bits(idBits);
     nvBits.in <== num_voters;
-    if (depth < 8) {
-        component nvCap = LessEqThan(9);
+    if (depth < idBits) {
+        component nvCap = LessEqThan(idBits + 1);
         nvCap.in[0] <== num_voters;
         nvCap.in[1] <== 1 << depth;
         nvCap.out === 1;
@@ -83,7 +83,7 @@ template ValidityChunk(C, nC, depth) {
     // per-slot validity — identical to the monolithic stage
     component bv[C];
     for (var j = 0; j < C; j++) {
-        bv[j] = BallotValidity(depth, nC);
+        bv[j] = BallotValidity(depth, nC, idBits);
         bv[j].eid_hash <== eid_hash;
         bv[j].mr <== mr;
         bv[j].num_voters <== num_voters;

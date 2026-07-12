@@ -21,10 +21,11 @@ pragma circom 2.0.0;
 //   * partial tallies leave the chunk ONLY as a hiding commitment tc
 //     (opened jointly by tally_sum_chunk.circom, revealing only totals).
 //
-// Sort key (ascending) = (1-valid)*2^33 + id*2^24 + pos, faithful because
-// valid is boolean, id < 2^9 (sentinel 256; real ids < 2^8) and
-// pos < 2^24 — all range-checked here, so comparators are sound
-// independently of the permutation argument.
+// Sort key (ascending) = (1-valid)*2^(25+idBits) + id*2^24 + pos,
+// faithful because valid is boolean, id < 2^(idBits+1) (sentinel
+// 2^idBits; real ids < 2^idBits) and pos < 2^24 — all range-checked
+// here, so comparators are sound independently of the permutation
+// argument. idBits = 14 gives 16,384-voter registration capacity.
 //
 // LEAKAGE: no product value (or ratio of products) is ever public. An
 // earlier design published pp_k = rho_k*P_k and qq_k = rho_k*Q_k, whose
@@ -38,7 +39,7 @@ include "circomlib/circuits/comparators.circom";
 include "circomlib/circuits/bitify.circom";
 include "../components/record_chain.circom";
 
-template SortedRunChunk(C, nC) {
+template SortedRunChunk(C, nC, idBits) {
     // ---------------- public inputs ----------------
     signal input gamma;             // multiset challenge (Fiat-Shamir)
     signal input delta;             // record-encoding challenge
@@ -96,7 +97,7 @@ template SortedRunChunk(C, nC) {
 
     // -------- range checks making the packed key faithful
     component validBit[C + 1];
-    component idBits[C + 1];
+    component idb[C + 1];
     component posBits[C + 1];
     signal rawKey[C + 1];  // rawKey[0] = boundary_in, rawKey[j+1] = sorted[j]
     for (var j = 0; j <= C; j++) {
@@ -108,21 +109,21 @@ template SortedRunChunk(C, nC) {
         }
         validBit[j] = Num2Bits(1);
         validBit[j].in <== v[0];
-        idBits[j] = Num2Bits(9);       // sentinel id = 256 needs 9 bits
-        idBits[j].in <== v[1];
+        idb[j] = Num2Bits(idBits + 1); // sentinel id = 2^idBits
+        idb[j].in <== v[1];
         posBits[j] = Num2Bits(24);
         posBits[j].in <== v[2];
-        rawKey[j] <== (1 - v[0]) * 8589934592 + v[1] * 16777216 + v[2];
+        rawKey[j] <== (1 - v[0]) * (2 ** (25 + idBits)) + v[1] * 16777216 + v[2];
     }
 
-    // The run-0 sentinel predecessor (id = 256) must not constrain
+    // The run-0 sentinel predecessor (id = 2^idBits) must not constrain
     // sortedness: its key is zeroed (0 <= anything). Sound because no
-    // multiset-bound record can carry id 256 (real record ids are < 2^8),
-    // and non-sentinel boundary records are multiset-bound via the
-    // previous run's boundary_out commitment.
+    // multiset-bound record can carry id 2^idBits (real record ids are
+    // < 2^idBits), and non-sentinel boundary records are multiset-bound
+    // via the previous run's boundary_out commitment.
     component isSent = IsEqual();
     isSent.in[0] <== bnd_in[1];
-    isSent.in[1] <== 256;
+    isSent.in[1] <== 2 ** idBits;
     signal key[C + 1];
     key[0] <== (1 - isSent.out) * rawKey[0];
     for (var j = 1; j <= C; j++) {
@@ -132,7 +133,7 @@ template SortedRunChunk(C, nC) {
     // -------- sortedness: key[j] <= key[j+1] (boundary included)
     component le[C];
     for (var j = 0; j < C; j++) {
-        le[j] = LessEqThan(34);
+        le[j] = LessEqThan(26 + idBits);
         le[j].in[0] <== key[j];
         le[j].in[1] <== key[j + 1];
         le[j].out === 1;

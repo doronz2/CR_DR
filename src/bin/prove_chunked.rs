@@ -10,10 +10,10 @@
 //! circuit artifacts (vchunk128, srun128, tsum{K}) and the rapidsnark
 //! prover (scripts/install_rapidsnark.sh).
 //!
-//! Registration uses the compiled depth-6 chunk circuits (<= 64 voters);
-//! the BOARD size is the cost driver (K = B/128 chunk proofs). Deeper
-//! registration trees for 10^4+ real voters add ~250 constraints per
-//! extra Merkle level per slot (~+25% at depth 14) — see BENCHMARKS.md.
+//! Registration uses the compiled depth-14, 14-bit-identity chunk
+//! circuits (up to 2^14 = 16,384 registered voters), so the default
+//! instance is a TRUE 10^4-registered-voter election; the BOARD size
+//! drives proving cost (K = B/128 chunk proofs). See BENCHMARKS.md.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -40,8 +40,8 @@ struct Args {
     /// Board size in ballots (K = ceil(ballots/128) chunks).
     #[arg(long, default_value_t = 20480)]
     ballots: usize,
-    /// Registered voters (compiled chunk circuits support <= 64).
-    #[arg(long, default_value_t = 64)]
+    /// Registered voters (compiled chunk circuits support <= 16,384).
+    #[arg(long, default_value_t = 10_000)]
     voters: usize,
     /// Concurrent chunk jobs (default: cores/6, rapidsnark is multithreaded).
     #[arg(long)]
@@ -65,9 +65,9 @@ fn main() -> anyhow::Result<()> {
     let config = ElectionConfig {
         eid: format!("chunked-{}", args.ballots),
         candidates: vec![0, 1, 2],
-        max_voters: 64,
+        max_voters: 1 << 14,
         max_ballots: 1 << 24,
-        merkle_depth: 6,
+        merkle_depth: 14,
         duplicate_rule: DuplicateRule::FirstValidCounts,
         threshold_params: Some(ThresholdParams { t: 2, k: 3 }),
     };

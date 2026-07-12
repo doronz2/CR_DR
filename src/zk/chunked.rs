@@ -321,10 +321,12 @@ pub fn chunked_relation_check_native(ct: &ChunkedTally) -> bool {
     if ct.rows.len() != k_chunks * c || ct.records.len() != k_chunks * c {
         return false;
     }
-    if st.duplicate_rule_id != 1 || st.num_voters >= 256 {
+    if st.duplicate_rule_id != 1 || st.num_voters >= (1 << crate::zk::mock_backend::ID_BITS) {
         return false;
     }
-    if ct.merkle_depth < 8 && st.num_voters > (1u64 << ct.merkle_depth) {
+    if ct.merkle_depth < crate::zk::mock_backend::ID_BITS
+        && st.num_voters > (1u64 << ct.merkle_depth)
+    {
         return false;
     }
     if st.num_ballots as usize > k_chunks * c || st.num_ballots >= 1 << 24 {
@@ -409,10 +411,10 @@ pub fn chunked_relation_check_native(ct: &ChunkedTally) -> bool {
         }
         // range + sortedness (boundary included; the run-0 sentinel's key
         // is zeroed, mirroring the circuit's is_sentinel gate)
-        let sentinel_in = bnd_in.id == 256;
+        let sentinel_in = bnd_in.id == crate::zk::mock_backend::SENTINEL_ID;
         let mut prev_key = if sentinel_in { 0 } else { bnd_in.key_wide() };
         for r in run {
-            if r.id >= 512 || r.pos >= (1 << 24) {
+            if r.id >= (1 << (crate::zk::mock_backend::ID_BITS + 1)) || r.pos >= (1 << 24) {
                 return false;
             }
             if prev_key > r.key_wide() {
