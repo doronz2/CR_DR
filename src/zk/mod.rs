@@ -4,6 +4,7 @@ pub mod circom_io;
 pub mod groth16_backend;
 pub mod mock_backend;
 pub mod statement;
+pub mod tier3;
 pub mod witness;
 
 /// Compile-time shape of a circuit instantiation. Must match the parameters

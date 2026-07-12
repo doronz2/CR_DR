@@ -18,3 +18,8 @@ campaign.log
 receipt.json
 widen_campaign.log
 e2e_points.log
+cocircom_install.log
+setup_mpc.log
+run_full_chunk_mpc.sh
+full_chunk_mpc.log
+setup_mpc8.log
