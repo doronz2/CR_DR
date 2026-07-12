@@ -58,6 +58,17 @@ the `d137a71` checkpoint:
   not AuthorityFaulty; fabricated openings ⇒ AuthorityFaulty) is stated
   explicitly in code docs, README §8, and the paper's dispute model.
 
+* **Identity widening (2026-07-12, `45eabdf`)**: idBits is now a
+  template parameter. Chunked circuits compiled at 14-bit ids +
+  depth-14 registration (16,384-voter capacity; vchunk128 1,493,956 /
+  srun128 96,920 constraints); monolithic stays 8-bit (structurally
+  unchanged). The measured N=10^4 result is now a TRUE
+  10^4-registered-voter proof: 10,000 voters, 20,480 ballots, 321
+  proofs — 1000.6 s prove / 67.6 s verify-all / 1.70 GB per worker
+  (matching the earlier x1.2 depth-only projection of ~1017 s). The
+  board-vs-voter caveat is gone; 10^5/10^6 remain projections at
+  idBits/depth 17 and 20 (+6%/+13%). 131 tests green.
+
 The original checkpoint snapshot follows (historical).
 
 ---

@@ -613,15 +613,14 @@ receipt in a coercer's hands; it needs a separate treatment.
 2. Cut-and-choose models the audit intuition, not a malicious VSS/DKG.
 3. The anonymous channel and EA payload channel are idealized models.
 4. Weak (arity-based) Poseidon domain separation.
-5. **Identities are effectively 8-bit in the real relation** — every
-   compiled circuit (monolithic and chunked) range-checks ids and
-   `num_voters` to 8 bits, capping registration at 256 voters. This is
-   THE next scalability gap: the measured N=10^4 result is a
-   10^4-BOARD result over ≤ 64 registered voters (honestly labeled in
-   BENCHMARKS.md); a true 10^4-registered-voter proof needs the id width
-   parameterized to ≥ 14 bits plus a depth-14 registration tree (the
-   depth-only variant is compiled for sizing: +19.9% constraints; the
-   id-width change is estimated < 1%).
+5. Identity width is a compile-time parameter (`idBits`): the CHUNKED
+   circuits are compiled at 14 bits with depth-14 registration (up to
+   16,384 registered voters — the measured N=10^4 result IS a true
+   10^4-registered-voter proof), while the monolithic small/medium
+   circuits keep 8 bits (their depth-4/6 trees cap voters at 16/64
+   anyway). 10^5/10^6 electorates need re-instantiating the same
+   templates at idBits/depth 17 or 20 (+6%/+13% constraints, projected
+   in BENCHMARKS.md) plus a fresh dev setup.
 6. Cast-as-intended out of scope (receipt-freeness hazard).
 7. Groth16 proving requires the election parameters to match a compiled
    circuit variant exactly (small: 16 slots/depth 4, medium: 128

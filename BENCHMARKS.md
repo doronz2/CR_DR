@@ -27,7 +27,8 @@ proving is claimed or benchmarked.**
 > verifier's rule — see tests/soft_safety_tests.rs). Tally circuits grew
 > ~22-24% relative to the pre-CAST format: small 116,035 -> 144,339
 > (naive 143,300), medium 1,009,483 -> 1,235,915 (naive 1,234,980),
-> validity chunk 1,017,911 -> ~1.25M. **All tables below are re-measured
+> validity chunk 1,017,911 -> 1,493,956 (now incl. depth-14/14-bit-id
+> registration). **All tables below are re-measured
 > on the current circuits** with freshly generated zkeys; the per-ballot
 > Path-1 costs are in the "CAST-ZK per-ballot costs" section at the end.
 
@@ -173,13 +174,14 @@ process, current circuits):
 | circuit | snarkjs prove | rapidsnark prove | witness gen (wasm) |
 |---|---|---|---|
 | medium B (1,235,915 constraints) | 9.26 GB | 1.56 GB | 0.47 GB |
-| validity chunk (1,245,383; sampled during the N=10^4 run) | — | 1.55 GB | — |
+| validity chunk (1,493,956; sampled during the N=10^4 run) | — | 1.70 GB | — |
 
 ## Chunked pipeline (implemented; boards beyond one circuit)
 
 The chunked route (CHUNKED_TALLY_DESIGN.md) is implemented end-to-end:
-K x ValidityChunk (~1.25M constraints, C = 128 slots) + K x
-SortedRunChunk (95,378) + 1 x TallySum (48,000 at K=160), with blinded record/run
+K x ValidityChunk (1,493,956 constraints, C = 128 slots, depth-14
+registration, 14-bit ids) + K x SortedRunChunk (96,920) + 1 x TallySum
+(48,000 at K=160), with blinded record/run
 commitments, a Fiat-Shamir grand-product permutation argument (both sides
 committed BEFORE the challenge; the running products cross chunk
 boundaries ONLY as hiding commitments, and the final equality is proven
@@ -201,20 +203,21 @@ Measured (rapidsnark prove, wasm witness gen, criterion sample 10;
 | validity chunk: witness gen / prove | 5.13 s / 3.19 s |
 | sorted-run chunk: witness gen / prove | 0.20 s / 0.26 s |
 | tally-sum proof | negligible |
-| e2e 500 ballots (K=4, 9 proofs) | 22.0 s (verify-all 1.9 s) |
-| e2e 1,000 ballots (K=8, 17 proofs) | 43.0 s (verify-all 3.5 s) |
+| e2e 500 ballots, 200 voters (K=4, 9 proofs) | 23.9 s (verify-all 1.9 s) |
+| e2e 1,000 ballots, 400 voters (K=8, 17 proofs) | 48.4 s (verify-all 3.6 s) |
 
 ## Measured scalability result (N = 10^4)
 
-**The headline result of this report**: a full 20,480-ballot chunked
-tally — the board size of an N = 10^4-voter election with B = 2N slots —
-proven and verified end-to-end on one laptop.
+**The headline result of this report**: a TRUE 10^4-registered-voter
+election — 10,000 registered voters on a depth-14 indexed registration
+tree with 14-bit identities, 20,480 board slots (B = 2N) — proven and
+verified end-to-end on one laptop.
 
 ### Reproducibility record
 
 | | |
 |---|---|
-| Commit | `593b428` ("Dispute verdicts: add NoAuthorityFault + external verdict coarsening"; the benchmarked tree — this file's numbers were added in the follow-up docs commit) |
+| Commit | `45eabdf` ("Widen chunked pipeline to 14-bit identities"; the benchmarked tree — this file's numbers were added in the follow-up docs commit) |
 | Hardware | Apple M3 Max, 14 cores, 36 GB RAM |
 | OS | macOS 14.3 (Darwin 23.3.0) |
 | Toolchain | rustc 1.96.1; Node.js v26.4.0; circom 2.1.9; snarkjs 0.7.6; rapidsnark master (built via `scripts/install_rapidsnark.sh`) |
@@ -225,7 +228,7 @@ Commands:
 ```bash
 scripts/compile_circuits.sh vchunk128   # + srun128, tsum160
 scripts/setup_groth16.sh   vchunk128    # + srun128, tsum160
-cargo run --release --bin prove_chunked -- --ballots 20480   # jobs = cores/6 = 2
+cargo run --release --bin prove_chunked   # defaults: --ballots 20480 --voters 10000
 ```
 
 Instance (synthetic, deterministic from `--seed 5000`; ADMISSION-PATH
@@ -235,64 +238,61 @@ per-voter costs are the `cast` group below):
 
 | parameter | value |
 |---|---|
+| registered voters N | **10,000** (dense ids 0..9,999 on the indexed table) |
 | board slots B | 20,480 (24-bit positions: POS_BITS = 24, boards to 2^24) |
-| registered voters in the instance | 64 (see the parameter caveat below) |
 | candidates | 3 |
-| real / fake-compliance / chaff ballots | 64 / 5 / 20,411 |
+| real / fake-compliance / chaff ballots | 10,000 / 5 / 10,475 |
 | chunk size C / chunks K / proofs 2K+1 | 128 / 160 / 321 |
-| ID_BITS / POS_BITS / MERKLE_DEPTH | 8 / 24 / 6 |
-| circuits (constraints) | vchunk128: 1,245,383; srun128: 95,378; tsum160: 48,000 |
+| ID_BITS / POS_BITS / MERKLE_DEPTH | 14 / 24 / 14 (capacity 16,384 voters) |
+| circuits (constraints) | vchunk128: 1,493,956; srun128: 96,920; tsum160: 48,000 |
 
 Measured results:
 
 | stage | measured |
 |---|---|
-| instance generation (native) | 18.4 s |
-| witness rows + records + commitments (native) | 57.5 s |
-| prove, 321 proofs (rapidsnark, jobs=2) | **847.5 s wall** (5.30 s/chunk-pair amortized) |
-| verify all 321 proofs (per-proof snarkjs CLI) | **67.1 s** (~3 ms/proof in-process pairing) |
-| peak memory per prover worker | 1.55 GB |
+| instance generation (native, incl. 10^4 voter preprocessings) | 21.4 s |
+| witness rows + records + commitments (native) | 73.2 s |
+| prove, 321 proofs (rapidsnark, jobs=2) | **1000.6 s wall** (16.7 min; 6.25 s/chunk-pair amortized) |
+| verify all 321 proofs (per-proof snarkjs CLI) | **67.6 s** (~3 ms/proof in-process pairing) |
+| peak memory per prover worker | 1.70 GB |
 | proof / public size (per proof) | 805 B / ≤449 B |
 
-### Parameter caveat and the widened-parameter projection factor
+Cross-check: the previous depth-6/8-bit run measured 847.5 s and the
+compiled depth-14 sizing predicted a x1.2 factor (~1017 s); the true
+widened run measured 1000.6 s — the projection methodology held.
 
-The compiled chunk circuits index a DEPTH-6 registration tree (<= 64
-voters, 8-bit ids): the measured run exercises the true 10^4-scale BOARD
-(the cost driver — K = B/128 chunk proofs) with 64 distinct registered
-voters. **It is a 10^4-BOARD result, not yet a 10^4-registered-voter
-proof.** A real 10^4-voter electorate needs (a) a depth-14 registration
-tree and (b) the identity width parameterized from 8 to >= 14 bits.
-Neither widened circuit is a working artifact yet: we compiled a
-DEPTH-ONLY sizing variant, `filter_and_tally_vchunk128_d14` =
-**1,493,181 constraints** = 1.199x the depth-6 chunk, which prices (a),
-the dominant term (8 extra Merkle levels per slot). The id-width change
-(b) is NOT in that variant — identities remain 8-bit in every compiled
-circuit (BallotValidity in-range check, sort-key packing, num_voters
-range checks, and the native checker's num_voters < 256 guard); widening
-it adds a few comparator bits per slot, estimated < 1%. All projections
-below therefore apply a **x1.2 factor**; the measured 10^4 row itself
-would be ~17 min instead of ~14 min on the widened circuits.
+### Scaling parameters beyond 10^4
+
+Chunk-circuit size is what scales with the ELECTORATE (the board scales
+only K). 10^5 registered voters need ID_BITS/MERKLE_DEPTH = 17 (+3
+Merkle levels per slot ≈ +6% constraints over the compiled depth-14
+circuits); 10^6 need 20 (+6 levels ≈ +13%). Both are one-line
+instantiation changes of the SAME parameterized templates
+(`ValidityChunk(C, nC, depth, idBits)` / `SortedRunChunk(C, nC, idBits)`)
+plus a fresh dev setup; neither is compiled here, so the 10^5/10^6
+columns below carry those growth factors as projections.
 
 ### Measured 10^4 vs projected 10^5 / 10^6
 
-Projections = measured per-chunk cost x K x 1.2 (widened params), same
-jobs scaling; they assume chunk independence (measured: chunks share no
-witness data) and linear aggregation checks (sub-second even at K=2^14).
+Projections = measured per-chunk cost x K x the depth-growth factor
+above, same jobs scaling; they assume chunk independence (measured:
+chunks share no witness data) and linear aggregation checks (sub-second
+even at K=2^14).
 
 | | N = 10^4 | N = 10^5 | N = 10^6 |
 |---|---|---|---|
 | board slots B = 2N | 20,480 | 204,800 | 2,048,000 |
 | chunks K / proofs 2K+1 | 160 / 321 | 1,600 / 3,201 | 16,000 / 32,001 |
-| prove, this M3 Max (jobs=2) | **14.1 min MEASURED** | ~2.8 h (proj., widened) | ~28 h (proj., widened) |
-| prove, 90-vCPU cloud box (jobs~15) | ~2.5 min (proj.) | ~25 min (proj.) | ~4 h (proj.) |
+| ID_BITS / MERKLE_DEPTH | **14 / 14 (compiled)** | 17 / 17 (projected) | 20 / 20 (projected) |
+| prove, this M3 Max (jobs=2) | **16.7 min MEASURED** | ~2.9 h (proj.) | ~31 h (proj.) |
+| prove, 90-vCPU cloud box (jobs~15) | ~2.2 min (proj.) | ~24 min (proj.) | ~4.2 h (proj.) |
 | verify all proofs (in-process, ~3 ms each) | ~1 s | ~10 s | ~96 s |
-| peak memory per worker | **1.55 GB MEASURED** | ~1.9 GB (widened) | ~1.9 GB (widened) |
+| peak memory per worker | **1.70 GB MEASURED** | ~1.8 GB (proj.) | ~1.9 GB (proj.) |
 
-The N = 10^4 column is MEASURED end-to-end (this section); N = 10^5 and
-N = 10^6 are PROJECTIONS, and they use the widened ID/POS/Merkle
-parameters (the x1.2 factor from the compiled depth-14 circuit), not the
-depth-6 circuits of the measured run. GCP_RUNBOOK.md gives the
-one-command cloud recipe.
+The N = 10^4 column is MEASURED end-to-end on the true 10^4-voter
+instance (this section); N = 10^5 and N = 10^6 are PROJECTIONS on the
+correspondingly widened parameters. GCP_RUNBOOK.md gives the one-command
+cloud recipe.
 
 ## Reading the numbers
 
