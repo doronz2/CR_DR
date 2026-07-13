@@ -12,15 +12,23 @@ sort + duplicate handling + tally output), widened to depth-11 registration
 and an idBits/posBits sort key (`components/filter_and_tally_mpc_large.circom`),
 was compiled at two sizes:
 
-| board B | depth | measured constraints | per-ballot |
+| board B | depth | constraints | per-ballot |
 |---|---|---|---|
 | 512 (`mid512_mpc`) | 11 | **5,688,324** (measured) | ~11,110 |
-| 2048 (`large_mpc`) | 11 | **~24 M** (projected from 512; compile in progress) | ~11,700 |
+| 2048 (`large_mpc`) | 11 | **~24 M** (projected; did NOT compile — see below) | ~11,700 |
 
 Validity is linear in B (~10.9k/ballot at depth 11: signature ~3.6k,
 Poseidon hashing, Merkle depth-11, strict decompositions); the Batcher sort
 is O(B·log²B) (≈2.1 M constraints at B=2048). So B=2048 ≈ **24 M
 constraints**.
+
+**The 2048 circuit does not even COMPILE on this machine.** `circom` on
+`filter_and_tally_large_mpc.circom` (B=2048) got through template
+instantiation and was then killed after ~9 min with a **peak memory
+footprint of ~75 GB** (this machine has 36 GB) — so the exact 2048
+constraint count could not be obtained here, and infeasibility bites at the
+COMPILE step, before the ceremony and co-circom blockers below even apply.
+(The B=512 circuit, ~5.7 M constraints, compiled fine at ~14 GB peak.)
 
 ### The two hard blockers
 
@@ -61,9 +69,15 @@ setting the two blockers aside.
 
 ### Verdict: INFEASIBLE on this stack (no-chunk, 2048)
 
-Blocked twice over — the 2²⁵ ceremony exceeds 36 GB RAM, and co-circom
-cannot MPC-extend the sort/duplicate stage at any size. We therefore pivot
-to a chunked architecture whose cross-chunk state stays secret-shared.
+Blocked THREE times over, in order of when they bite:
+0. the circuit does not compile (circom ~75 GB peak footprint > 36 GB RAM);
+1. even if compiled, the 2²⁵ ceremony (~36 GB ptau) exceeds 36 GB RAM so
+   the zkey cannot be produced;
+2. even with a zkey, co-circom cannot MPC-extend the sort/duplicate stage
+   at any size.
+We therefore pivot to a chunked architecture whose cross-chunk state stays
+secret-shared (each chunk circuit is small enough to compile, set up under
+pot21, and — for validity — MPC-prove today).
 
 ## 2. Chunked full Tier-3 — architecture (all cross-chunk state secret-shared)
 
@@ -175,8 +189,10 @@ per-voter share-placement above is what a real deployment uses.
 ## Summary
 
 A no-chunk monolithic full-MPC tally for 2048 slots is **infeasible on this
-stack**: ~24 M constraints ⇒ a 2²⁵ ceremony that exceeds 36 GB RAM, and
-co-circom cannot MPC-extend the sort/duplicate stage at any size. The
+stack**: the circuit does not even compile here (circom ~75 GB peak footprint
+vs 36 GB RAM); ~24 M constraints would need a 2²⁵ ceremony that also exceeds
+36 GB RAM; and co-circom cannot MPC-extend the sort/duplicate stage at any
+size. The
 feasible route to full Tier-3 is the **chunked** architecture above, whose
 only fundamentally new component is an **MPC oblivious sort over
 secret-shared records** (plus inter-circuit share transport); the rest maps
