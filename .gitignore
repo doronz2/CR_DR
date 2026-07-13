@@ -23,3 +23,6 @@ setup_mpc.log
 run_full_chunk_mpc.sh
 full_chunk_mpc.log
 setup_mpc8.log
+setup_medmpc.log
+run_tier3_full.sh
+tier3_full_run.log

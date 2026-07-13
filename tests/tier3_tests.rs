@@ -109,6 +109,56 @@ fn in_circuit_combine_matches_shamir_reconstruction() {
 }
 
 #[test]
+fn full_providers_hide_r_ea_records_and_tally() {
+    // FULL Tier-3: the monolithic-circuit provider inputs must contain no
+    // R_EA, no tally, and no records/sorted/duplicate/partial-tally arrays
+    // — those are all computed inside the MPC. The opening provider carries
+    // only openings + the PUBLIC statement + registration rows; the two
+    // authority providers carry only their own share arrays.
+    use cr_dr::protocol::admission::admitted_from_ballots;
+    use cr_dr::protocol::setup::setup_election;
+    use cr_dr::zk::tier3::full_providers;
+    let mut rng = ChaCha20Rng::seed_from_u64(6000);
+    let config = ElectionConfig {
+        eid: "tier3-full-test".into(),
+        candidates: vec![0, 1, 2],
+        max_voters: 64,
+        max_ballots: 128,
+        merkle_depth: 6,
+        duplicate_rule: DuplicateRule::FirstValidCounts,
+        threshold_params: Some(ThresholdParams { t: 2, k: 3 }),
+    };
+    let (pp, mut authority) = setup_election(config, &mut rng).unwrap();
+    let (mut vs, mut recs) = (Vec::new(), Vec::new());
+    for id in 0..30u64 {
+        let (v, r) = preprocess_voter(&pp, &mut authority, id, &mut rng).unwrap();
+        vs.push(v);
+        recs.push(r);
+    }
+    let reg = finalize_registration(&pp, &recs).unwrap();
+    let mut ballots = Vec::new();
+    for (i, v) in vs.iter().enumerate() {
+        ballots.push(cast_vote(&pp, &reg, v, 1 + (i as u64 % 2), &mut rng).unwrap());
+    }
+    let (admitted, openings) = admitted_from_ballots(&ballots);
+    let p = full_providers(&pp, &authority, &reg, &admitted, &openings, 128, 6).unwrap();
+
+    let o = p.opening.as_object().unwrap();
+    assert!(!o.contains_key("r_ea") && !o.contains_key("tally_counts"));
+    // no record / sorted / duplicate / partial-tally / grand-product arrays
+    for forbidden in ["records", "sorted", "counted", "partial_tallies", "acc_p", "acc_q", "rc"] {
+        assert!(!o.contains_key(forbidden), "opening leaks {forbidden}");
+    }
+    // opening supplies openings + registration + public statement only
+    for req in ["pt", "rho", "ct", "reg_vkx", "reg_h", "path_elements", "bb_commitment", "num_ballots"] {
+        assert!(o.contains_key(req), "opening missing {req}");
+    }
+    assert_eq!(o["pt"].as_array().unwrap().len(), 128);
+    assert_eq!(p.authority_a.as_object().unwrap().keys().collect::<Vec<_>>(), vec!["r_ea_share_a"]);
+    assert_eq!(p.authority_b.as_object().unwrap().keys().collect::<Vec<_>>(), vec!["r_ea_share_b"]);
+}
+
+#[test]
 fn tier3_mpc_proof_verifies_end_to_end() {
     // OPT-IN heavy test: a real 3-party REP3 MPC proof of the validity
     // relation that verifies under the standard key. Needs co-circom +

@@ -49,7 +49,7 @@ use std::process::Command;
 use serde_json::{json, Value};
 
 use crate::errors::{CrDrError, Result};
-use crate::types::{f_to_dec, f_to_u64, AuthoritySecretState, F};
+use crate::types::{f_to_dec, f_to_u64, AuthoritySecretState, F, PLAINTEXT_FIELD_LEN};
 use crate::zk::chunked::ChunkedTally;
 
 /// The three provider input files for one validity chunk. Each is a
@@ -151,6 +151,119 @@ pub fn provider_leaks_r_ea(v: &Value) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// FULL Tier-3: the whole monolithic relation in one MPC circuit
+// ---------------------------------------------------------------------------
+
+/// Build the three provider inputs for the FULL monolithic MPC relation
+/// (`filter_and_tally_medium_mpc`, `FilterAndTallyMpc(nb, nC, depth)`),
+/// WITHOUT `build_chunked_tally` and WITHOUT reconstructing R_EA. The
+/// opening provider derives its rows from the ballot openings and the
+/// PUBLIC registration table (validity records, the sort, duplicate
+/// counting and the tally are all computed later inside the MPC — never
+/// here); the two authority providers supply only their own Shamir-share
+/// arrays. `tally_counts` is NOT supplied — it is the circuit's public
+/// OUTPUT, computed in MPC and revealed.
+///
+/// No records, sorted records, duplicate structure, partial tallies or
+/// grand-product values are ever constructed by this function or any
+/// single party.
+pub fn full_providers(
+    pp: &crate::types::PublicParams,
+    authority: &AuthoritySecretState,
+    reg: &crate::protocol::preprocessing::RegistrationState,
+    admitted: &crate::protocol::bulletin_board::AdmittedBoard,
+    openings: &crate::protocol::admission::AdmittedOpenings,
+    nb: usize,
+    depth: usize,
+) -> Result<ChunkProviderInputs> {
+    use crate::crypto::hash::{bb_commitment, candidate_set_commitment, pk_ea_commitment};
+    let num_ballots = admitted.len();
+    let num_voters = reg.records.len() as u64;
+    if num_ballots > nb {
+        return Err(CrDrError::ZkToolchain(format!(
+            "board has {num_ballots} ballots but the MPC circuit holds {nb}"
+        )));
+    }
+
+    let zero = F::from(0u64);
+    let (mut ct, mut pt, mut rho) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut vkx, mut vky, mut hh, mut paths) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut sa, mut sb) = (Vec::new(), Vec::new());
+
+    for j in 0..nb {
+        if j < num_ballots {
+            let (pt_fields, r) = crate::protocol::filter_and_tally::opening_checked(admitted, openings, j)?;
+            ct.push(admitted.coms[j]);
+            pt.push(pt_fields.to_vec());
+            rho.push(r);
+            // Registration row + path (PUBLIC) and R_EA shares, by claimed id.
+            let id = f_to_u64(&pt_fields[1]);
+            let (rvx, rvy, rh, path, share_a, share_b) = match id {
+                Some(id) if id < num_voters => {
+                    let rec = reg.record(id);
+                    let path = reg
+                        .paths
+                        .get(&id)
+                        .map(|p| p.elements.clone())
+                        .unwrap_or_else(|| vec![zero; depth]);
+                    let (ssa, ssb) = match authority.voter_secrets.get(&id) {
+                        Some(s) if s.r_ea_shares.len() >= 2 => {
+                            (s.r_ea_shares[0].value, s.r_ea_shares[1].value)
+                        }
+                        _ => (zero, zero),
+                    };
+                    match rec {
+                        Some(r) => (r.vk.x, r.vk.y, r.h, path, ssa, ssb),
+                        None => (zero, zero, zero, vec![zero; depth], zero, zero),
+                    }
+                }
+                _ => (zero, zero, zero, vec![zero; depth], zero, zero),
+            };
+            vkx.push(rvx);
+            vky.push(rvy);
+            hh.push(rh);
+            paths.push(path);
+            sa.push(share_a);
+            sb.push(share_b);
+        } else {
+            // padding slot (circuit gates active = 0)
+            ct.push(zero);
+            pt.push(vec![zero; PLAINTEXT_FIELD_LEN]);
+            rho.push(zero);
+            vkx.push(zero);
+            vky.push(zero);
+            hh.push(zero);
+            paths.push(vec![zero; depth]);
+            sa.push(zero);
+            sb.push(zero);
+        }
+    }
+
+    let ct_fields: Vec<Vec<F>> = admitted.coms.iter().map(|c| vec![*c]).collect();
+    let opening = json!({
+        "eid_hash": dec(&pp.eid_hash),
+        "mr": dec(&reg.root),
+        "candidate_set_commitment": dec(&candidate_set_commitment(&pp.candidates)),
+        "bb_commitment": dec(&bb_commitment(&ct_fields)),
+        "num_ballots": num_ballots.to_string(),
+        "num_voters": num_voters.to_string(),
+        "duplicate_rule_id": pp.duplicate_rule.id().to_string(),
+        "pk_ea_commitment": dec(&pk_ea_commitment(&pp.pk_ea)),
+        "candidates": pp.candidates.iter().map(|x| x.to_string()).collect::<Vec<_>>(),
+        "ct": ct.iter().map(dec).collect::<Vec<_>>(),
+        "pt": pt.iter().map(|r| Value::Array(r.iter().map(dec).collect())).collect::<Vec<_>>(),
+        "rho": rho.iter().map(dec).collect::<Vec<_>>(),
+        "reg_vkx": vkx.iter().map(dec).collect::<Vec<_>>(),
+        "reg_vky": vky.iter().map(dec).collect::<Vec<_>>(),
+        "reg_h": hh.iter().map(dec).collect::<Vec<_>>(),
+        "path_elements": paths.iter().map(|p| Value::Array(p.iter().map(dec).collect())).collect::<Vec<_>>(),
+    });
+    let authority_a = json!({ "r_ea_share_a": sa.iter().map(dec).collect::<Vec<_>>() });
+    let authority_b = json!({ "r_ea_share_b": sb.iter().map(dec).collect::<Vec<_>>() });
+    Ok(ChunkProviderInputs { opening, authority_a, authority_b })
+}
+
+// ---------------------------------------------------------------------------
 // co-circom subprocess orchestration
 // ---------------------------------------------------------------------------
 
@@ -197,6 +310,29 @@ impl CoCircomBackend {
     /// The full-width (C=128) MPC chunk.
     pub fn discover(crate_root: &Path) -> Option<Self> {
         Self::discover_width(crate_root, 128)
+    }
+
+    /// Discover the co-circom install and the artifacts for an arbitrary
+    /// MPC circuit `name` (e.g. `filter_and_tally_medium_mpc`, the full
+    /// monolithic relation) under `crate_root`.
+    pub fn discover_named(crate_root: &Path, name: &str) -> Option<Self> {
+        let bin = which_co_circom()?;
+        let build = crate_root.join("build/circuits");
+        let zkey = build.join(format!("{name}.zkey"));
+        let vk = build.join(format!("{name}_verification_key.json"));
+        let circuit = crate_root.join(format!("circuits/main/{name}.circom"));
+        if !zkey.exists() || !vk.exists() || !circuit.exists() {
+            return None;
+        }
+        Some(CoCircomBackend {
+            bin,
+            circuit,
+            zkey,
+            vk,
+            link_library: crate_root.join("node_modules"),
+            assets_dir: crate_root.join("build/tier3"),
+            base_port: 20000,
+        })
     }
 
     pub fn available(&self) -> bool {

@@ -9,8 +9,47 @@ real but architecturally simulated** in the localhost benchmark.
 
 No single party ever reconstructs, in the clear, any of: the full tally
 witness, the decrypted ballot openings, the authority nonce `R_EA`, the
-per-ballot validity records, the accepted identities. The tally proof is
-produced by an MPC among several parties over a **secret-shared** witness.
+per-ballot validity records, the sorted records, the duplicate structure,
+the partial tallies, the grand-product values, or the accepted identities.
+The tally proof is produced by an MPC among several parties over a
+**secret-shared** witness, and only the final tally is revealed.
+
+## Two entry points
+
+- **`prove_tier3_full`** — the FULL relation (validity → records → sort →
+  duplicate counting → tally) in ONE co-circom MPC over a secret-shared
+  witness. Nothing is centrally constructed; the tally is the circuit's
+  public output. This is the complete Tier-3 answer (bounded in board
+  size by the monolithic circuit / trusted setup — see below).
+- **`prove_tier3`** — the earlier stepping stone: only the phase-1
+  *validity* chunk of the chunked pipeline, proven in MPC. Kept because it
+  exercises the chunked public interface, but it does NOT achieve full
+  decentralization on its own (see "Why the full relation, not the chunked
+  pipeline").
+
+## Why the full relation, not the chunked pipeline
+
+The chunked pipeline (CHUNKED_TALLY_DESIGN.md) exists to keep each
+single-prover circuit small. But its phases are glued by a **central
+orchestrator** (`build_chunked_tally`) that computes, in the clear, the
+per-ballot records, the GLOBAL sort, the boundary commitments, the
+grand-product accumulators and the partial tallies, then feeds them as
+witness to the next phase. That central construction is exactly what full
+Tier-3 must eliminate — so the chunked pipeline is structurally the wrong
+vehicle. Making it decentralized would require an MPC oblivious sort plus
+transport of secret-shared records between the phase circuits, which
+co-circom's independent-circuit model does not provide.
+
+The **monolithic** relation has no such glue: validity records, the
+Batcher sort, the first-valid duplicate counting and the tally accumulation
+are all INTERNAL wires of one circuit. Proving that circuit in MPC extends
+its entire witness on secret shares, so none of those intermediates is ever
+constructed centrally or seen by any party. `prove_tier3_full` therefore
+does NOT call `build_chunked_tally` at all. The cost is circuit size: a
+monolithic circuit for a board of `B` ballots is `O(B)` in ballots plus the
+`O(B log^2 B)` sort, so the trusted-setup power of tau bounds `B` (the
+compiled `filter_and_tally_medium_mpc` holds `nb = 128`; reaching
+`B ≈ 2·10^3` needs a larger ceremony — see BENCHMARKS.md "Tier-3").
 
 ## How it works
 
@@ -82,27 +121,34 @@ same public transcript and aggregate verifier.
 - **The Groth16 proof** — produced by collaborative proving over the shared
   witness (`generate-proof`), verifies under the standard key.
 
-### Still centralized IN THIS INTEGRATION (documented, not yet MPC)
+### With `prove_tier3_full` (the full relation)
 
-- **Phase-2 sorted-run + tally-sum proving.** Only the phase-1 *validity*
-  relation is proven in MPC here. The sorted-run chunks (which hold the
-  *sorted* records and thus the duplicate structure) and the tally-sum
-  proof are still produced by the Tier-1 single prover. They are the same
-  kind of Circom/Groth16 circuit and the identical co-circom flow extends
-  to them; wiring + benchmarking them is the remaining Tier-3 step. Until
-  then, the *sorted* records and duplicate structure are decentralized only
-  to the extent phase-1 already hides them (records leave phase-1 as the
-  hiding commitment `rc`; phase-2 re-opens them to a single prover).
+The whole tally computation is in MPC, so the records, the sorted records,
+the duplicate structure, the partial tallies and the tally are ALL
+decentralized (internal wires; only the final tally is revealed as the
+public output). There is no phase-2 orchestrator. The remaining
+non-decentralized pieces are:
+
+- **Board size bound.** The monolithic circuit holds `nb = 128` ballots on
+  the compiled ceremony; larger boards need a larger power-of-tau (see the
+  benchmark projection). This is a *scale* limit, not a leak.
 - **Threshold decryption of `ct_open`.** Path 1 avoids it (the voter
   provides its own opening as a provider input). A Path-2 deployment, where
   the EA holds the openings, would need a threshold-decryption MPC to
   produce opening *shares* without any party decrypting — not implemented.
-- **The benchmark harness knows everything.** `prove_tier3` generates a
-  synthetic election, so the driver process holds all secrets (it created
-  them). That is a property of the *benchmark generator*, not of the
-  co-circom parties: the `.shared` provider files and the MPC processes
-  never contain `R_EA` or the cleartext witness. A real deployment has the
-  providers generate their own inputs independently.
+- **The benchmark harness knows everything.** The driver generates a
+  synthetic election, so that process holds all secrets (it created them).
+  That is a property of the *benchmark generator*, not of the co-circom
+  parties: the `.shared` provider files and the MPC processes never contain
+  `R_EA`, the tally, or the cleartext witness. A real deployment has each
+  provider generate its own inputs independently.
+
+### With `prove_tier3` (validity chunk only)
+
+Additionally, only phase-1 validity is in MPC; the phase-2 sorted-run and
+tally-sum proofs (holding the *sorted* records and duplicate structure) are
+still the Tier-1 single prover. Use `prove_tier3_full` for the complete
+property.
 
 ### Cryptographically real but architecturally SIMULATED (localhost)
 
