@@ -150,6 +150,21 @@ pub fn provider_leaks_r_ea(v: &Value) -> bool {
     v.get("r_ea").is_some()
 }
 
+/// Union the three provider inputs into ONE circom input (opening +
+/// r_ea_share_a + r_ea_share_b). Used only by the central-witness
+/// collaborative-proving path (`prove_collaborative`); the decentralized
+/// MPC path never forms this union in the clear.
+pub fn merged_input(p: &ChunkProviderInputs) -> Value {
+    let mut m = p.opening.clone();
+    let obj = m.as_object_mut().unwrap();
+    for extra in [&p.authority_a, &p.authority_b] {
+        for (k, v) in extra.as_object().unwrap() {
+            obj.insert(k.clone(), v.clone());
+        }
+    }
+    m
+}
+
 // ---------------------------------------------------------------------------
 // FULL Tier-3: the whole monolithic relation in one MPC circuit
 // ---------------------------------------------------------------------------
@@ -279,6 +294,8 @@ pub struct CoCircomBackend {
     pub link_library: PathBuf, // circomlib include root (node_modules)
     pub assets_dir: PathBuf,   // TLS certs/keys + generated party configs
     pub base_port: u16,
+    /// circom optimisation level for MPC witness extension ("O0".."O2").
+    pub witext_opt: String,
 }
 
 impl CoCircomBackend {
@@ -304,6 +321,7 @@ impl CoCircomBackend {
             link_library: crate_root.join("node_modules"),
             assets_dir: crate_root.join("build/tier3"),
             base_port: 20000,
+            witext_opt: "O2".into(),
         })
     }
 
@@ -332,6 +350,7 @@ impl CoCircomBackend {
             link_library: crate_root.join("node_modules"),
             assets_dir: crate_root.join("build/tier3"),
             base_port: 20000,
+            witext_opt: "O2".into(),
         })
     }
 
@@ -458,7 +477,7 @@ impl CoCircomBackend {
             let inp = work.join(format!("input.{party}.shared")).to_string_lossy().to_string();
             let out = work.join(format!("witness.{party}.shared")).to_string_lossy().to_string();
             vec![
-                "generate-witness".into(), "-O2".into(), "--input".into(), inp,
+                "generate-witness".into(), format!("-{}", self.witext_opt), "--input".into(), inp,
                 "--circuit".into(), circ.clone(), "--protocol".into(), "REP3".into(),
                 "--curve".into(), "BN254".into(), "--config".into(), cfg, "--out".into(), out,
             ]
@@ -475,6 +494,68 @@ impl CoCircomBackend {
                 "generate-proof".into(), "groth16".into(), "--witness".into(), wit,
                 "--zkey".into(), zkey.clone(), "--protocol".into(), "REP3".into(),
                 "--curve".into(), "BN254".into(), "--config".into(), cfg, "--out".into(), out,
+            ];
+            if party == 0 {
+                a.push("--public-input".into());
+                a.push(public0.to_string_lossy().to_string());
+            }
+            a
+        })?;
+        Ok((proof0, public0))
+    }
+
+    /// COLLABORATIVE PROVING of the full relation from a CENTRALLY-computed
+    /// witness. Honesty: this computes the extended witness with a single
+    /// snarkjs process (so it does NOT decentralize witness extension), then
+    /// secret-shares that witness (`split-witness`) and runs 3-party MPC
+    /// Groth16 proving. It exists because co-circom v0.10.0's MPC witness
+    /// extension miscompiles this circuit's duplicate/tally stage (see
+    /// TIER3_DESIGN.md); it demonstrates that the full relation's
+    /// collaborative PROVING works and reveals the correct tally, while the
+    /// MPC witness EXTENSION of the full relation remains blocked upstream.
+    /// The validity relation (`prove_tier3`) has NO such caveat — it is fully
+    /// MPC including witness extension.
+    pub fn prove_collaborative(&self, merged_input: &Value, work: &Path) -> Result<(PathBuf, PathBuf)> {
+        let (_cc, party_cfgs) = self.write_configs()?;
+        let stem = self.zkey.file_stem().unwrap().to_string_lossy().to_string();
+        let build = self.zkey.parent().unwrap();
+        let r1cs = build.join(format!("{stem}.r1cs"));
+        let wasm = build.join(format!("{stem}_js")).join(format!("{stem}.wasm"));
+        let gen_js = build.join(format!("{stem}_js")).join("generate_witness.js");
+
+        // 1. CENTRAL witness (snarkjs) — the documented non-decentralized step.
+        let input_path = work.join("merged_input.json");
+        std::fs::write(&input_path, serde_json::to_vec(merged_input).unwrap()).map_err(io)?;
+        let wtns = work.join("witness.wtns");
+        let out = Command::new("node")
+            .arg(&gen_js).arg(&wasm).arg(&input_path).arg(&wtns)
+            .env("NODE_OPTIONS", "--max-old-space-size=16384")
+            .output()
+            .map_err(|e| CrDrError::ZkToolchain(format!("snarkjs witgen spawn: {e}")))?;
+        if !out.status.success() {
+            return Err(CrDrError::ZkToolchain(format!(
+                "central witness generation failed:\n{}", String::from_utf8_lossy(&out.stderr))));
+        }
+
+        // 2. Secret-share the witness across the 3 parties.
+        self.run(&[
+            "split-witness", "--witness", &wtns.to_string_lossy(), "--r1cs", &r1cs.to_string_lossy(),
+            "--protocol", "REP3", "--curve", "BN254", "--out-dir", &work.to_string_lossy(),
+            "--config", &self.assets_dir.join("compiler.toml").to_string_lossy(),
+        ])?;
+
+        // 3. 3-party MPC Groth16 proving over the witness shares.
+        let zkey = self.zkey.to_string_lossy().to_string();
+        let proof0 = work.join("proof.0.json");
+        let public0 = work.join("public_input.json");
+        let wtns_s = wtns.to_string_lossy().to_string();
+        self.parallel_parties(&party_cfgs, |party, cfg| {
+            let wit = format!("{wtns_s}.{party}.shared");
+            let outp = work.join(format!("proof.{party}.json")).to_string_lossy().to_string();
+            let mut a: Vec<String> = vec![
+                "generate-proof".into(), "groth16".into(), "--witness".into(), wit,
+                "--zkey".into(), zkey.clone(), "--protocol".into(), "REP3".into(),
+                "--curve".into(), "BN254".into(), "--config".into(), cfg, "--out".into(), outp,
             ];
             if party == 0 {
                 a.push("--public-input".into());

@@ -26,3 +26,7 @@ setup_mpc8.log
 setup_medmpc.log
 run_tier3_full.sh
 tier3_full_run.log
+setup_smallmpc.log
+setup_smallnaive.log
+setup_tiny.log
+setup_mednaive.log

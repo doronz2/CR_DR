@@ -159,6 +159,68 @@ fn full_providers_hide_r_ea_records_and_tally() {
 }
 
 #[test]
+fn tier3_full_relation_collaborative_proof_verifies() {
+    // OPT-IN heavy test: the FULL relation (validity+sort+duplicate+tally)
+    // proven in 3-party MPC collaborative proving, revealing the correct
+    // tally. Uses the central-witness path (co-circom v0.10.0 cannot
+    // MPC-extend the duplicate/tally stage — see TIER3_DESIGN.md), so it
+    // exercises decentralized PROVING of the full relation. Skips without
+    // the env var / artifacts.
+    if std::env::var("CR_DR_TIER3_MPC").is_err() {
+        eprintln!("SKIP: set CR_DR_TIER3_MPC=1 to run the full-relation MPC proof test");
+        return;
+    }
+    use cr_dr::protocol::admission::admitted_from_ballots;
+    use cr_dr::protocol::filter_and_tally::filter_and_tally;
+    use cr_dr::protocol::setup::setup_election;
+    use cr_dr::zk::groth16_backend::SnarkjsBackend;
+    use cr_dr::zk::tier3::{full_providers, merged_input, CoCircomBackend};
+
+    let root = SnarkjsBackend::crate_root();
+    let Some(be) = CoCircomBackend::discover_named(&root, "filter_and_tally_small_mpc_naive") else {
+        eprintln!("SKIP: small_mpc_naive artifacts not found");
+        return;
+    };
+    if !be.assets_dir.join("key0.der").exists() {
+        eprintln!("SKIP: demo TLS assets missing");
+        return;
+    }
+    let mut rng = ChaCha20Rng::seed_from_u64(7000);
+    let config = ElectionConfig {
+        eid: "tier3-full-mpc-test".into(),
+        candidates: vec![0, 1, 2],
+        max_voters: 16,
+        max_ballots: 16,
+        merkle_depth: 4,
+        duplicate_rule: DuplicateRule::FirstValidCounts,
+        threshold_params: Some(ThresholdParams { t: 2, k: 3 }),
+    };
+    let (pp, mut authority) = setup_election(config, &mut rng).unwrap();
+    let (mut vs, mut recs) = (Vec::new(), Vec::new());
+    for id in 0..6u64 {
+        let (v, r) = preprocess_voter(&pp, &mut authority, id, &mut rng).unwrap();
+        vs.push(v);
+        recs.push(r);
+    }
+    let reg = finalize_registration(&pp, &recs).unwrap();
+    let mut ballots = Vec::new();
+    for (i, v) in vs.iter().enumerate() {
+        ballots.push(cast_vote(&pp, &reg, v, 1 + (i as u64 % 2), &mut rng).unwrap());
+    }
+    let (admitted, openings) = admitted_from_ballots(&ballots);
+    let (expected, _) = filter_and_tally(&pp, &authority, &reg, &admitted, &openings).unwrap();
+    let providers = full_providers(&pp, &authority, &reg, &admitted, &openings, 16, 4).unwrap();
+    let work = be.assets_dir.join("test_full");
+    std::fs::create_dir_all(&work).unwrap();
+    let (proof, public) = be.prove_collaborative(&merged_input(&providers), &work).unwrap();
+    assert!(be.verify(&proof, &public).unwrap(), "full-relation MPC proof must verify");
+    let got: serde_json::Value = serde_json::from_slice(&std::fs::read(&public).unwrap()).unwrap();
+    let tally: Vec<u64> = got.as_array().unwrap().iter().take(3)
+        .map(|v| v.as_str().unwrap().parse().unwrap()).collect();
+    assert_eq!(tally, expected.counts, "MPC-revealed tally must equal the expected tally");
+}
+
+#[test]
 fn tier3_mpc_proof_verifies_end_to_end() {
     // OPT-IN heavy test: a real 3-party REP3 MPC proof of the validity
     // relation that verifies under the standard key. Needs co-circom +
