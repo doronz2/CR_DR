@@ -392,3 +392,42 @@ sequential on one machine. Phase-2 sorted-run/tally-sum is still the Tier-1
 prover here (seconds). This is the measured full-chunk cost times the chunk
 count; it is a projection only in the sense that we measured ONE chunk, not
 all 16 (they are identical circuits on disjoint slots).
+
+### The FULL relation in MPC (`prove_tier3_full`)
+
+The chunked pipeline above proves only the phase-1 VALIDITY relation in
+MPC. `prove_tier3_full` instead proves the ENTIRE monolithic relation
+(validity + Batcher sort + first-valid duplicate counting + tally) as ONE
+co-circom circuit, so — by design — no records, sorted records, duplicate
+structure, partial tallies or grand-product values are ever constructed
+centrally; the tally is the circuit's public OUTPUT and R_EA is combined
+in-circuit from per-authority shares. Two honestly-separated results:
+
+| what | mode | measured (nb=128, `medium_mpc(_naive)`) | decentralizes |
+|---|---|---|---|
+| full relation, collaborative proving | `--mode proving-mpc` | **19.3 s, verified, tally [2,29,29]** (peak 3.6 GB) | PROVING only |
+| full relation, witness ext.+proving | `--mode full-mpc` | **blocked by co-circom v0.10.0** (see below) | (would be everything) |
+
+* **`--mode proving-mpc`** computes the extended witness with ONE snarkjs
+  process, then secret-shares it and runs 3-party MPC Groth16 proving —
+  verified, correct revealed tally. This decentralizes the PROVING of the
+  whole relation but NOT its witness extension (the central witness step
+  sees the records/tally), so it is a *partial* result, loudly flagged at
+  runtime.
+* **`--mode full-mpc`** (decentralize witness extension AND proving — the
+  genuine Tier-3) does NOT complete: co-circom v0.10.0's MPC witness
+  extension miscompiles the duplicate/tally stage (wrong/unsatisfying
+  witness under -O2; panic/hang under -O1/-O0; both Strategy A and B; at
+  nb=4/16/128). The circuit is proven CORRECT independently — plain snarkjs
+  produces a satisfying witness whose Groth16 proof verifies with the right
+  tally, and co-circom collaborative proving over a split witness verifies
+  — so this is a limitation of the experimental, un-audited co-circom
+  MPC-VM on that circuitry, NOT of our circuit or design. The phase-1
+  validity relation (same gadgets minus duplicate/tally) extends+proves in
+  MPC without issue (the `prove_tier3` numbers above).
+
+**Net Tier-3 status.** Fully decentralized INCLUDING MPC witness extension:
+the VALIDITY relation (measured, verified). Implemented + proven correct,
+with collaborative PROVING working in MPC (measured) but witness extension
+blocked upstream: the FULL relation. See TIER3_DESIGN.md for the complete
+real-vs-simulated matrix.

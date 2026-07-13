@@ -85,6 +85,20 @@ the `d137a71` checkpoint:
   sorted-run/tally-sum still Tier-1); co-circom experimental/un-audited.
   Suite: 134 passed / 0 failed (Tier-3 MPC test opt-in via CR_DR_TIER3_MPC=1).
 
+* **Full Tier-3 (2026-07-13)**: the whole tally relation as one MPC
+  circuit (validity+sort+duplicate+tally; records/sorted/duplicate/partial
+  tallies all internal; R_EA in-circuit from shares; tally as public
+  output; no build_chunked_tally). Finding: co-circom v0.10.0's MPC
+  witness EXTENSION miscompiles the duplicate/tally stage (both strategies,
+  nb=4/16/128) — the circuit is proven correct (snarkjs + co-circom
+  collaborative proving on a split witness). `prove_tier3_full` has
+  --mode full-mpc (reports the co-circom limitation) and --mode
+  proving-mpc (decentralizes PROVING over a central witness; nb=128
+  measured 19.3s, verified, tally [2,29,29]). Fully decentralized incl.
+  witness extension remains the VALIDITY relation (prove_tier3). Docs:
+  TIER3_DESIGN.md per-mode matrix + co-circom limitation; BENCHMARKS.md
+  full-relation rows. 136 tests.
+
 The original checkpoint snapshot follows (historical).
 
 ---
