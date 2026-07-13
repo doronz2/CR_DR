@@ -30,3 +30,6 @@ setup_smallmpc.log
 setup_smallnaive.log
 setup_tiny.log
 setup_mednaive.log
+run_tier3_full_bench.sh
+tier3_full_bench.log
+compile_large.log
